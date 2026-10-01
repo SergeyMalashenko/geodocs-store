@@ -146,6 +146,11 @@ class DocumentStore:
             Path(files_dir) if files_dir is not None else self._db_path.parent / "files"
         )
         self._files_dir.mkdir(parents=True, exist_ok=True)
+        self._conn: sqlite3.Connection | None = None
+        self._connect()
+
+    def _connect(self) -> None:
+        """(Пере)открывает соединение; безопасно после close()."""
         self._conn = sqlite3.connect(str(self._db_path), timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -169,10 +174,15 @@ class DocumentStore:
 
     @property
     def connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._connect()
+        assert self._conn is not None
         return self._conn
 
     def close(self) -> None:
-        self._conn.close()
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     def __enter__(self) -> DocumentStore:  # noqa: PYI034  # нет typing.Self на py3.10
         return self
@@ -194,8 +204,8 @@ class DocumentStore:
         municipality = _normalize(municipality)
         number = _normalize(number)
         doc_type = DocType(doc_type)
-        with self._conn:
-            self._conn.execute(
+        with self.connection:
+            self.connection.execute(
                 "INSERT INTO documents"
                 " (municipality, doc_type, number, title, issuer, region_code, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
@@ -209,7 +219,7 @@ class DocumentStore:
                     _utcnow(),
                 ),
             )
-            row = self._conn.execute(
+            row = self.connection.execute(
                 "SELECT id FROM documents"
                 " WHERE municipality = ? AND doc_type = ? AND number = ?",
                 (municipality, doc_type.value, number),
@@ -227,8 +237,8 @@ class DocumentStore:
         issuer: str | None = None,
     ) -> int:
         """Идемпотентно создаёт редакцию документа и возвращает её id."""
-        with self._conn:
-            self._conn.execute(
+        with self.connection:
+            self.connection.execute(
                 "INSERT INTO document_versions"
                 " (document_id, version_date, role, amendment_number, title, issuer,"
                 "  created_at)"
@@ -243,7 +253,7 @@ class DocumentStore:
                     _utcnow(),
                 ),
             )
-            row = self._conn.execute(
+            row = self.connection.execute(
                 "SELECT id FROM document_versions"
                 " WHERE document_id = ? AND version_date = ?",
                 (document_id, version_date),
@@ -276,8 +286,8 @@ class DocumentStore:
         self, version_id: int, source: SourceName, source_object_id: str
     ) -> None:
         """Фиксирует, что версию обнаружил данный источник."""
-        with self._conn:
-            self._conn.execute(
+        with self.connection:
+            self.connection.execute(
                 "INSERT INTO document_sources"
                 " (version_id, source, source_object_id, discovered_at)"
                 " VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
@@ -287,8 +297,8 @@ class DocumentStore:
     def link_parcel(self, cadastral_number: str, version_id: int) -> None:
         """Привязывает кадастровый номер к версии, обновляя last_seen_at."""
         now = _utcnow()
-        with self._conn:
-            self._conn.execute(
+        with self.connection:
+            self.connection.execute(
                 "INSERT INTO parcel_documents"
                 " (cadastral_number, version_id, first_seen_at, last_seen_at)"
                 " VALUES (?, ?, ?, ?)"
@@ -306,7 +316,7 @@ class DocumentStore:
         version_date: str,
     ) -> DocumentVersionRecord | None:
         """Ищет редакцию по идентичности документа (проверка «уже в базе»)."""
-        row = self._conn.execute(
+        row = self.connection.execute(
             "SELECT v.* FROM document_versions v"
             " JOIN documents d ON d.id = v.document_id"
             " WHERE d.municipality = ? AND d.doc_type = ? AND d.number = ?"
@@ -340,7 +350,7 @@ class DocumentStore:
         владельцем хэша (и уникального индекса) остаётся версия, сохранившая
         файл первой.
         """
-        row = self._conn.execute(
+        row = self.connection.execute(
             "SELECT d.municipality, d.doc_type, d.number, v.version_date"
             " FROM document_versions v"
             " JOIN documents d ON d.id = v.document_id"
@@ -371,7 +381,7 @@ class DocumentStore:
         )
 
         def update(file_path: Path, stored_sha256: str | None) -> None:
-            self._conn.execute(
+            self.connection.execute(
                 update_sql,
                 (
                     str(file_path),
@@ -386,7 +396,7 @@ class DocumentStore:
 
         def add_version_file(file_path: Path, stored_sha256: str | None) -> None:
             if stored_sha256 is not None:
-                self._conn.execute(
+                self.connection.execute(
                     "INSERT INTO version_files"
                     " (version_id, title, section, file_path, sha256, size_bytes,"
                     "  created_at)"
@@ -403,7 +413,7 @@ class DocumentStore:
                     ),
                 )
             else:
-                self._conn.execute(
+                self.connection.execute(
                     "INSERT INTO version_files"
                     " (version_id, title, section, file_path, sha256, size_bytes,"
                     "  created_at)"
@@ -423,8 +433,8 @@ class DocumentStore:
                     ),
                 )
 
-        with self._conn:
-            existing = self._conn.execute(
+        with self.connection:
+            existing = self.connection.execute(
                 "SELECT id, file_path FROM version_files"
                 " WHERE sha256 = ? AND version_id != ?",
                 (sha256, version_id),
@@ -441,7 +451,7 @@ class DocumentStore:
                     add_version_file(final_path, sha256)
                 except sqlite3.IntegrityError:
                     # Гонка: другой писатель успел сохранить тот же контент.
-                    existing = self._conn.execute(
+                    existing = self.connection.execute(
                         "SELECT id, file_path FROM version_files"
                         " WHERE sha256 = ? AND version_id != ?",
                         (sha256, version_id),
@@ -461,8 +471,8 @@ class DocumentStore:
         source_url: str | None = None,
     ) -> None:
         """Обновляет состояние загрузки версии."""
-        with self._conn:
-            self._conn.execute(
+        with self.connection:
+            self.connection.execute(
                 "UPDATE document_versions SET fetch_status = ?,"
                 " source_url = COALESCE(?, source_url) WHERE id = ?",
                 (FetchStatus(status).value, source_url, version_id),
@@ -482,8 +492,8 @@ class DocumentStore:
         """Идемпотентно сохраняет извлечённый фрагмент, заменяя payload."""
         payload_json = json.dumps(payload, ensure_ascii=False)
         kind = ExtractionKind(kind)
-        with self._conn:
-            self._conn.execute(
+        with self.connection:
+            self.connection.execute(
                 "INSERT INTO extractions"
                 " (version_id, zone_code, kind, origin, payload_json, extractor,"
                 "  confidence, created_at)"
@@ -504,7 +514,7 @@ class DocumentStore:
                     _utcnow(),
                 ),
             )
-            row = self._conn.execute(
+            row = self.connection.execute(
                 "SELECT id FROM extractions"
                 " WHERE version_id = ? AND zone_code = ? AND kind = ?",
                 (version_id, zone_code, kind.value),
@@ -515,7 +525,7 @@ class DocumentStore:
         self, version_id: int, *, zone_code: str, kind: ExtractionKind
     ) -> ExtractionRecord | None:
         """Возвращает извлечённый фрагмент версии, если он есть."""
-        row = self._conn.execute(
+        row = self.connection.execute(
             "SELECT * FROM extractions"
             " WHERE version_id = ? AND zone_code = ? AND kind = ?",
             (version_id, zone_code, ExtractionKind(kind).value),
@@ -524,7 +534,7 @@ class DocumentStore:
 
     def extractions_for_version(self, version_id: int) -> list[ExtractionRecord]:
         """Все извлечённые фрагменты версии."""
-        rows = self._conn.execute(
+        rows = self.connection.execute(
             "SELECT * FROM extractions WHERE version_id = ? ORDER BY id",
             (version_id,),
         ).fetchall()
@@ -532,14 +542,14 @@ class DocumentStore:
 
     def get_document(self, document_id: int) -> DocumentRecord | None:
         """Документ по id."""
-        row = self._conn.execute(
+        row = self.connection.execute(
             "SELECT * FROM documents WHERE id = ?", (document_id,)
         ).fetchone()
         return DocumentRecord(**_row_dict(row)) if row is not None else None
 
     def sources_for_version(self, version_id: int) -> list[str]:
         """Источники, обнаружившие версию (provenance)."""
-        rows = self._conn.execute(
+        rows = self.connection.execute(
             "SELECT source FROM document_sources WHERE version_id = ?"
             " ORDER BY source",
             (version_id,),
@@ -548,7 +558,7 @@ class DocumentStore:
 
     def source_refs_for_version(self, version_id: int) -> list[tuple[str, str]]:
         """Пары (source, source_object_id), обнаружившие версию (provenance)."""
-        rows = self._conn.execute(
+        rows = self.connection.execute(
             "SELECT source, source_object_id FROM document_sources"
             " WHERE version_id = ? ORDER BY source, source_object_id",
             (version_id,),
@@ -557,7 +567,7 @@ class DocumentStore:
 
     def files_for_version(self, version_id: int) -> list[VersionFileRecord]:
         """Все файлы версии (текстовая часть, НПА, зональные регламенты)."""
-        rows = self._conn.execute(
+        rows = self.connection.execute(
             "SELECT * FROM version_files WHERE version_id = ? ORDER BY id",
             (version_id,),
         ).fetchall()
@@ -565,7 +575,7 @@ class DocumentStore:
 
     def documents_for_parcel(self, cadastral_number: str) -> list[DocumentVersionRecord]:
         """Все версии документов, привязанные к кадастровому номеру."""
-        rows = self._conn.execute(
+        rows = self.connection.execute(
             "SELECT v.* FROM document_versions v"
             " JOIN parcel_documents p ON p.version_id = v.id"
             " WHERE p.cadastral_number = ? ORDER BY v.id",
@@ -575,7 +585,7 @@ class DocumentStore:
 
     def links_for_version(self, version_id: int) -> list[ParcelDocumentLink]:
         """Все кадастровые номера, привязанные к версии."""
-        rows = self._conn.execute(
+        rows = self.connection.execute(
             "SELECT * FROM parcel_documents WHERE version_id = ?"
             " ORDER BY cadastral_number",
             (version_id,),
@@ -584,7 +594,7 @@ class DocumentStore:
 
     def versions_for_document(self, document_id: int) -> list[DocumentVersionRecord]:
         """Все редакции документа."""
-        rows = self._conn.execute(
+        rows = self.connection.execute(
             "SELECT * FROM document_versions WHERE document_id = ? ORDER BY id",
             (document_id,),
         ).fetchall()
@@ -594,7 +604,7 @@ class DocumentStore:
         """Счётчики записей по всем таблицам."""
         return {
             table: int(
-                self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+                self.connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
             )
             for table in _TABLES
         }

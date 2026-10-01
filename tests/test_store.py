@@ -368,3 +368,25 @@ def test_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         assert store.db_path == tmp_path / "home" / "geodocs.sqlite3"
         assert store.files_dir == tmp_path / "home" / "files"
         assert store.db_path.exists()
+
+
+def test_store_reconnects_after_close(tmp_path):
+    """close() не должен убивать store: MCP-серверы переоткрывают соединение."""
+    store = DocumentStore(tmp_path / "geodocs.sqlite3")
+    ref = DocumentRef(
+        municipality="Городской округ Клин",
+        doc_type=DocType.PZZ,
+        number="1756",
+        version_date="2026-05-25",
+        role=DocRole.SINGLE,
+        region_code="50",
+        source=SourceName.RGIS,
+        source_object_id="1",
+    )
+    version_id = store.register_ref(ref)
+    store.close()
+
+    store.link_parcel("50:03:0070212:522", version_id)
+    (versions,) = [store.documents_for_parcel("50:03:0070212:522")]
+    assert [v.id for v in versions] == [version_id]
+    store.close()
