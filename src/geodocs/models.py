@@ -37,6 +37,7 @@ class SourceName(str, Enum):
     NSPD = "nspd"
     CNTD = "cntd"
     MUNICIPAL = "municipal"
+    KIMI_AGENT = "kimi-agent"
 
 
 class FetchStatus(str, Enum):
@@ -147,3 +148,13 @@ class ParcelDocumentLink(BaseModel):
     version_id: int
     first_seen_at: datetime
     last_seen_at: datetime
+
+
+class FileRecord(BaseModel):
+    """Файл версии, доставленный агентным ярусом (вход record_agent_fetch)."""
+
+    path: str
+    size: int
+    sha256: str | None = None
+    title: str | None = None
+    section: str | None = None

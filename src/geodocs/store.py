@@ -21,6 +21,7 @@ from .models import (
     ExtractionOrigin,
     ExtractionRecord,
     FetchStatus,
+    FileRecord,
     ParcelDocumentLink,
     SourceName,
     VersionFileRecord,
@@ -124,6 +125,36 @@ def _normalize(value: str) -> str:
 def _safe_component(value: str) -> str:
     """Оставляет в компоненте пути только буквы, цифры и `._-`."""
     return re.sub(r"[^\w.-]+", "_", value) or "_"
+
+
+def _agent_file_section(name: str) -> str:
+    """Раздел version_files по имени файла: карта/регламент/текст/файл."""
+    folded = name.casefold()
+    if "карт" in folded:
+        return "карта"
+    if "регламент" in folded:
+        return "регламент"
+    if any(marker in folded for marker in ("изменен", "решение", "постановлен", "генплан")):
+        return "текст"
+    return "файл"
+
+
+def _primary_agent_file(files: list[FileRecord]) -> FileRecord:
+    """Первичный файл редакции: PDF с «изменен»/«решение» в имени, иначе первый PDF, иначе первый файл."""
+    def is_pdf(record: FileRecord) -> bool:
+        return record.path.casefold().endswith(".pdf")
+
+    def named(record: FileRecord) -> bool:
+        name = (record.title or Path(record.path).name).casefold()
+        return "изменен" in name or "решение" in name
+
+    for record in files:
+        if is_pdf(record) and named(record):
+            return record
+    for record in files:
+        if is_pdf(record):
+            return record
+    return files[0]
 
 
 def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -477,6 +508,71 @@ class DocumentStore:
                 " source_url = COALESCE(?, source_url) WHERE id = ?",
                 (FetchStatus(status).value, source_url, version_id),
             )
+
+    def record_agent_fetch(
+        self,
+        version_id: int,
+        *,
+        files: list[FileRecord],
+        source_url: str | None,
+        fetched_at: str,
+    ) -> None:
+        """Фиксирует результат агентного яруса одной транзакцией.
+
+        Первичным файлом редакции становится первый PDF с «изменен»/«решение»
+        в имени, иначе первый PDF, иначе первый файл. Набор `version_files`
+        версии заменяется целиком, provenance дополняется источником
+        kimi-agent. `source_url=None` означает, что URL неизвестен (приём
+        готовых файлов из inbox без манифеста): прежний source_url версии
+        сохраняется, запись provenance не добавляется (source_object_id
+        обязателен в схеме). Повторный вызов с теми же файлами идемпотентен.
+        """
+        if not files:
+            raise ValueError("files не должен быть пустым")
+        primary = _primary_agent_file(files)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE document_versions SET file_path = ?, sha256 = ?,"
+                " source_url = COALESCE(?, source_url),"
+                " source_provider = ?, fetch_status = ?,"
+                " fetched_at = ? WHERE id = ?",
+                (
+                    primary.path,
+                    primary.sha256,
+                    source_url,
+                    SourceName.KIMI_AGENT.value,
+                    FetchStatus.DOWNLOADED.value,
+                    fetched_at,
+                    version_id,
+                ),
+            )
+            self.connection.execute(
+                "DELETE FROM version_files WHERE version_id = ?", (version_id,)
+            )
+            for record in files:
+                name = record.title or Path(record.path).name
+                self.connection.execute(
+                    "INSERT INTO version_files"
+                    " (version_id, title, section, file_path, sha256, size_bytes,"
+                    "  created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        version_id,
+                        record.title,
+                        record.section or _agent_file_section(name),
+                        record.path,
+                        record.sha256,
+                        record.size,
+                        _utcnow(),
+                    ),
+                )
+            if source_url is not None:
+                self.connection.execute(
+                    "INSERT INTO document_sources"
+                    " (version_id, source, source_object_id, discovered_at)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (version_id, SourceName.KIMI_AGENT.value, source_url, fetched_at),
+                )
 
     def upsert_extraction(
         self,

@@ -25,6 +25,9 @@ dependencies = [
     "pydantic>=2.10",
 ]
 
+[project.scripts]
+geodocs-agent = "geodocs.agent.cli:main"
+
 [dependency-groups]
 test = [
     "pytest>=8.3",
