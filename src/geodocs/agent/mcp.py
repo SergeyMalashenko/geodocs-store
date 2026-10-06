@@ -38,7 +38,7 @@ from typing import Any
 import httpx
 
 from ..models import DocType, DocumentRef, FileRecord, SourceName
-from .gate import gate_pass, verify_files
+from .gate import DOCUMENT_SUFFIXES, gate_pass, verify_files
 from .portals import Candidate, DocQuery, PortalError, get_portal, list_portals
 
 INBOX_ENV = "GEODOCS_AGENT_INBOX"
@@ -46,17 +46,6 @@ _MAX_CANDIDATES = 20
 _MAX_TEXT_CHARS = 100_000
 _PDFTOTEXT = shutil.which("pdftotext")
 _UNKNOWN_VERSION_DATE = "unknown"  # как в store.py: редакция без даты
-# Расширения, которые гейт способен принять (см. gate._SIZE_THRESHOLDS).
-_IMPORTABLE_SUFFIXES = {
-    ".pdf",
-    ".docx",
-    ".doc",
-    ".zip",
-    ".rar",
-    ".png",
-    ".jpg",
-    ".jpeg",
-}
 _ZONE_CODE_RE = re.compile(r"[А-ЯЁA-Z]{1,4}-\d{1,2}")
 
 
@@ -560,7 +549,7 @@ async def import_document_impl(
         downloaded = [
             ctx.inbox / name
             for name in sorted(after - before)
-            if (ctx.inbox / name).suffix.casefold() in _IMPORTABLE_SUFFIXES
+            if (ctx.inbox / name).suffix.casefold() in DOCUMENT_SUFFIXES
         ]
     if not downloaded:
         return {"error": "по ссылке не найдено файлов документа (PDF/DOCX/...)"}

@@ -22,6 +22,12 @@ _UNKNOWN = "unknown"
 _MISSING = "missing"
 _READ_HEAD = 8
 
+# Расширения файлов, которые гейт способен принять (соответствуют kind'ам
+# _SIZE_THRESHOLDS). Всё прочее (page_text.txt, HTML-оглавления) — не документ.
+DOCUMENT_SUFFIXES = frozenset(
+    {".pdf", ".jpeg", ".jpg", ".png", ".docx", ".doc", ".rar", ".zip"}
+)
+
 
 class FileVerdict(BaseModel):
     """Вердикт по одному файлу: определённый тип, размер и итоговая валидность."""

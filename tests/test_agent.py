@@ -816,6 +816,144 @@ def test_run_task_broken_inbox_without_manifest_escalates(
     assert store.files_for_version(task.version_id) == []
 
 
+def _sleeping_agent(tmp_path: Path, inbox: Path, files: dict[str, bytes]) -> Path:
+    """Shell-заглушка медленного агента: копирует файлы и засыпает (таймаут)."""
+    staging = tmp_path / f"staging_sleep_{time.time_ns() % 10_000}"
+    staging.mkdir(exist_ok=False)
+    for name, data in files.items():
+        (staging / name).write_bytes(data)
+    copy_line = (
+        f"cp {shlex.quote(str(staging))}/* {shlex.quote(str(inbox))}/\n"
+        if files
+        else ""
+    )
+    script = tmp_path / f"sleeping_agent_{staging.name}.sh"
+    script.write_text(
+        "#!/bin/bash\n"
+        "set -e\n"
+        f"mkdir -p {shlex.quote(str(inbox))}\n"
+        f"{copy_line}"
+        "sleep 30\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _sleeping_executor(script: Path) -> Executor:
+    return build_executor(
+        ExecutorConfig(
+            name="hermes",
+            type="hermes",
+            command=str(script),
+            args=[],
+            timeout_seconds=2,
+            quota_patterns=[],
+        )
+    )
+
+
+def test_run_task_recovers_inbox_on_timeout(
+    store: DocumentStore, seeded: dict[str, int], tmp_path: Path
+) -> None:
+    """Таймаут (медленная модель), но файлы скачаны: дожим по уликам inbox.
+
+    page_text.txt рядом с PDF гейт не отравляет — recovery берёт только
+    файлы-документы.
+    """
+    task = list_pending_tasks(store, statuses=("not_found",))[0]
+    home = store.db_path.parent
+    script = _sleeping_agent(
+        tmp_path,
+        home / "inbox" / task.slug,
+        {
+            "2026-04-09_решение.pdf": _pdf_bytes(),
+            "page_text.txt": b"page text",  # не документ
+        },
+    )
+
+    result = run_task(
+        task,
+        store,
+        executors=[_sleeping_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
+
+    assert result.status == "downloaded"
+    assert result.error is not None
+    assert "не уложился" in result.error
+    assert "recovered from inbox evidence after timeout" in result.error
+    stored = store.files_for_version(task.version_id)
+    assert [Path(f.file_path).name for f in stored] == ["2026-04-09_решение.pdf"]
+    version = store.find_version(
+        municipality=MUNICIPALITY,
+        doc_type=DocType.PZZ,
+        number="944",
+        version_date=AMENDMENT_DATE,
+    )
+    assert version is not None
+    assert version.fetch_status is FetchStatus.DOWNLOADED
+
+
+def test_run_task_timeout_empty_inbox_escalates(
+    store: DocumentStore, seeded: dict[str, int], tmp_path: Path
+) -> None:
+    """Таймаут без файлов в inbox — дожимать нечего: manual_required."""
+    task = list_pending_tasks(store, statuses=("not_found",))[0]
+    home = store.db_path.parent
+    script = _sleeping_agent(tmp_path, home / "inbox" / task.slug, {})
+
+    result = run_task(
+        task,
+        store,
+        executors=[_sleeping_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
+
+    assert result.status == "manual_required"
+    assert result.error and "не уложился" in result.error
+    version = store.find_version(
+        municipality=MUNICIPALITY,
+        doc_type=DocType.PZZ,
+        number="944",
+        version_date=AMENDMENT_DATE,
+    )
+    assert version is not None
+    assert version.fetch_status is FetchStatus.NOT_FOUND
+    assert store.files_for_version(task.version_id) == []
+
+
+def test_run_task_recovers_inbox_ignores_page_text(
+    store: DocumentStore, seeded: dict[str, int], tmp_path: Path
+) -> None:
+    """Без манифеста: page_text.txt рядом с валидным PDF не ломает recovery."""
+    task = list_pending_tasks(store, statuses=("not_found",))[0]
+    home = store.db_path.parent
+    script = _fake_agent(
+        tmp_path,
+        home / "inbox" / task.slug,
+        {
+            "2026-04-09_решение.pdf": _pdf_bytes(),
+            "page_text.txt": b"page text",
+        },
+        None,
+    )
+
+    result = run_task(
+        task,
+        store,
+        executors=[_script_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
+
+    assert result.status == "downloaded"
+    stored = store.files_for_version(task.version_id)
+    assert [Path(f.file_path).name for f in stored] == ["2026-04-09_решение.pdf"]
+
+
 def test_run_pending_limit_and_pause(
     store: DocumentStore,
     seeded: dict[str, int],

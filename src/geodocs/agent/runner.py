@@ -27,7 +27,7 @@ from .executors import (
     QuotaExceeded,
     build_executor,
 )
-from .gate import FileVerdict, gate_pass, verify_files
+from .gate import DOCUMENT_SUFFIXES, FileVerdict, gate_pass, verify_files
 from .prompt import build_prompt
 from .tasks import AgentTask, list_pending_tasks
 
@@ -157,6 +157,15 @@ def _inbox_names(inbox: Path) -> list[str]:
     return sorted(path.name for path in inbox.iterdir() if path.is_file())
 
 
+def _inbox_document_names(inbox: Path) -> list[str]:
+    """Файлы inbox, похожие на документы: без page_text.txt и прочего мусора."""
+    return [
+        name
+        for name in _inbox_names(inbox)
+        if Path(name).suffix.casefold() in DOCUMENT_SUFFIXES
+    ]
+
+
 def _collect_files(
     names: list[str],
     inbox: Path,
@@ -253,7 +262,10 @@ def _attempt_with_executor(
     QuotaExceeded пробрасывается наружу (обрабатывает цепочка). Успех =
     гейт принял inbox; версия переходит в downloaded (record_agent_fetch с
     provider реально отработавшего исполнителя). Без манифеста, но с валидным
-    inbox результат дожимается по уликам из inbox.
+    inbox результат дожимается по уликам из inbox — в том числе при таймауте
+    (медленная локальная модель могла успеть скачать файлы до убийства).
+    В recovery-режимах учитываются только файлы-документы (DOCUMENT_SUFFIXES):
+    page_text.txt от fetch_page и прочий мусор гейт не отравляют.
     """
     inbox = inbox_dir(home, task)
     inbox.mkdir(parents=True, exist_ok=True)
@@ -271,6 +283,13 @@ def _attempt_with_executor(
         exec_result = executor.run(prompt, home)
     except ExecutionTimeout as exc:
         error = str(exc)
+        # агент убит по таймауту, но мог успеть скачать валидные файлы
+        verdicts, copied = _collect_files(
+            _inbox_document_names(inbox), inbox, store, task
+        )
+        if _gate_and_register(verdicts, copied, store, task, None, executor.provider):
+            status = "downloaded"
+            error += "; recovered from inbox evidence after timeout"
     except ExecutorError as exc:
         error = str(exc)
     else:
@@ -288,7 +307,7 @@ def _attempt_with_executor(
                 # манифест потерян (типично: квота убила агента после
                 # скачивания) — принимаем по уликам из inbox
                 verdicts, copied = _collect_files(
-                    _inbox_names(inbox), inbox, store, task
+                    _inbox_document_names(inbox), inbox, store, task
                 )
                 if _gate_and_register(
                     verdicts, copied, store, task, None, executor.provider
@@ -466,7 +485,7 @@ def recover_inbox(
     inbox = inbox_dir(home, task)
     started = time.monotonic()
 
-    verdicts, copied = _collect_files(_inbox_names(inbox), inbox, store, task)
+    verdicts, copied = _collect_files(_inbox_document_names(inbox), inbox, store, task)
     if _gate_and_register(verdicts, copied, store, task, None, SourceName.MANUAL):
         status: TaskStatus = "downloaded"
         error: str | None = None
