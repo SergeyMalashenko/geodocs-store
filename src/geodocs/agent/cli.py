@@ -149,7 +149,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skills-dir",
         action="append",
         default=None,
-        help="дополнительный каталог скилов Kimi (повторяемый флаг)",
+        help="дополнительный каталог скилов агента (повторяемый флаг)",
     )
 
     recover_parser = subparsers.add_parser(
@@ -172,6 +172,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stats_parser.add_argument(
         "--json", action="store_true", help="вывести сводку как JSON"
+    )
+
+    ask_parser = subparsers.add_parser(
+        "ask",
+        help="запрос к локальной базе документов свободным текстом (Q&A через агента)",
+    )
+    ask_parser.add_argument(
+        "query", help="например: «Верни ВРИ для документа № 944 Солнечногорск»"
+    )
+    ask_parser.add_argument(
+        "--executor",
+        default="hermes",
+        help="исполнитель из agents.yaml (по умолчанию: hermes)",
     )
     return parser
 
@@ -199,6 +212,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(render_stats(stats))
             return 0
+
+        if args.command == "ask":
+            from .ask import ask_document
+
+            result = ask_document(args.query, home=home, executor_name=args.executor)
+            print(result.answer)
+            print(
+                f"---\nисполнитель: {result.executor},"
+                f" код {result.returncode}, {result.duration_seconds:.0f} с",
+                file=sys.stderr,
+            )
+            return 0 if result.returncode == 0 else 1
 
         if args.command == "recover":
             results = recover_pending(

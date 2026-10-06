@@ -1,8 +1,11 @@
 """MCP-сервер статических инструментов агентного яруса.
 
-Даёт LLM-агенту (Kimi) детерминированные инструменты вместо свободного
+Даёт LLM-агенту (Hermes) детерминированные инструменты вместо свободного
 веб-поиска: поиск по порталам-донорам, скачивание файлов в inbox, чтение
-HTML-страниц и проверка локальной базы. Запуск — stdio:
+HTML-страниц и проверку локальной базы. Отдельная группа read-only
+инструментов (find_documents, document_files, read_document_text,
+get_extractions) обслуживает Q&A поверх локальной базы — см. agent/ask.py.
+Запуск — stdio:
 
     GEODOCS_AGENT_INBOX=<inbox> GEODOCS_HOME=<home> geodocs-agent-mcp
 
@@ -14,6 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import shutil
+import subprocess
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +31,8 @@ from .portals import Candidate, DocQuery, PortalError, get_portal, list_portals
 
 INBOX_ENV = "GEODOCS_AGENT_INBOX"
 _MAX_CANDIDATES = 20
+_MAX_TEXT_CHARS = 100_000
+_PDFTOTEXT = shutil.which("pdftotext")
 
 
 class McpMissingError(RuntimeError):
@@ -198,6 +207,164 @@ def check_local_store_impl(
 
 
 # ---------------------------------------------------------------------------
+# Read-only инструменты локальной базы (Q&A поверх скачанных документов)
+# ---------------------------------------------------------------------------
+
+
+def _open_store(ctx: McpContext) -> Any:
+    from ..store import DocumentStore
+
+    return DocumentStore(ctx.home / "geodocs.sqlite3", files_dir=ctx.home / "files")
+
+
+def find_documents_impl(
+    ctx: McpContext,
+    query: str,
+    doc_type: str | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Поиск версий в локальной базе по подстроке: номер, название, муниципалитет."""
+    store = _open_store(ctx)
+    try:
+        like = f"%{query}%"
+        sql = (
+            "SELECT v.id, d.municipality, d.doc_type, d.number, v.version_date,"
+            " d.title, v.fetch_status FROM document_versions v"
+            " JOIN documents d ON d.id = v.document_id"
+            " WHERE (d.number LIKE ? OR d.title LIKE ? OR d.municipality LIKE ?)"
+        )
+        params: list[Any] = [like, like, like]
+        if doc_type:
+            sql += " AND d.doc_type = ?"
+            params.append(doc_type)
+        sql += " ORDER BY v.id LIMIT ?"
+        params.append(max(1, min(limit, 50)))
+        rows = store.connection.execute(sql, params).fetchall()
+    finally:
+        store.close()
+    return {
+        "versions": [
+            {
+                "version_id": row["id"],
+                "municipality": row["municipality"],
+                "doc_type": row["doc_type"],
+                "number": row["number"],
+                "version_date": row["version_date"],
+                "title": row["title"],
+                "fetch_status": row["fetch_status"],
+            }
+            for row in rows
+        ]
+    }
+
+
+def document_files_impl(ctx: McpContext, version_id: int) -> dict[str, Any]:
+    """Файлы версии: путь, название, размер — что читать через read_document_text."""
+    store = _open_store(ctx)
+    try:
+        files = store.files_for_version(version_id)
+    finally:
+        store.close()
+    return {
+        "files": [
+            {
+                "index": index,
+                "path": file.file_path,
+                "title": file.title,
+                "size": file.size_bytes,
+            }
+            for index, file in enumerate(files)
+        ]
+    }
+
+
+_XML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _docx_text(path: Path) -> str:
+    """Плоский текст DOCX: word/document.xml без тегов, абзацы — переводы строк."""
+    with zipfile.ZipFile(path) as archive:
+        xml = archive.read("word/document.xml").decode("utf-8", errors="replace")
+    xml = xml.replace("</w:p>", "\n")
+    return _XML_TAG_RE.sub("", xml)
+
+
+def read_document_text_impl(
+    ctx: McpContext,
+    version_id: int,
+    file_index: int = 0,
+    max_chars: int = 12_000,
+) -> dict[str, Any]:
+    """Текст файла версии: pdf → pdftotext -layout, docx/html/txt — напрямую."""
+    store = _open_store(ctx)
+    try:
+        files = store.files_for_version(version_id)
+    finally:
+        store.close()
+    if not files:
+        return {"error": f"у версии {version_id} нет файлов"}
+    if file_index < 0 or file_index >= len(files):
+        return {"error": f"file_index {file_index} вне диапазона 0..{len(files) - 1}"}
+    file = files[file_index]
+    path = Path(file.file_path)
+    if not path.is_file():
+        return {"error": f"файл не найден на диске: {path}"}
+    suffix = path.suffix.casefold()
+    if suffix == ".pdf":
+        if _PDFTOTEXT is None:
+            return {"error": "pdftotext не установлен (пакет poppler-utils)"}
+        proc = subprocess.run(
+            [_PDFTOTEXT, "-layout", str(path), "-"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {"error": f"pdftotext: {proc.stderr.strip()[:300]}"}
+        text = proc.stdout
+    elif suffix == ".docx":
+        text = _docx_text(path)
+    elif suffix in {".html", ".htm", ".txt"}:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    else:
+        return {"error": f"неподдерживаемый тип файла: {suffix or '(нет расширения)'}"}
+    limit = max(1_000, min(max_chars, _MAX_TEXT_CHARS))
+    truncated = len(text) > limit
+    return {
+        "path": str(path),
+        "title": file.title,
+        "text": text[:limit],
+        "total_chars": len(text),
+        "truncated": truncated,
+    }
+
+
+def get_extractions_impl(ctx: McpContext, version_id: int) -> dict[str, Any]:
+    """Уже извлечённые структурированные фрагменты версии (таблицы ВРИ и др.)."""
+    store = _open_store(ctx)
+    try:
+        records = store.extractions_for_version(version_id)
+    finally:
+        store.close()
+    return {
+        "extractions": [
+            {
+                "zone_code": record.zone_code,
+                "kind": record.kind.value,
+                "origin": record.origin.value,
+                "extractor": record.extractor,
+                "confidence": record.confidence,
+                "payload": record.payload,
+            }
+            for record in records
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
 # Сборка сервера и точка входа
 # ---------------------------------------------------------------------------
 
@@ -261,6 +428,48 @@ def build_server(ctx: McpContext) -> Any:
         doc_type: str, number: str, version_date: str
     ) -> dict[str, Any]:
         return check_local_store_impl(ctx, doc_type, number, version_date)
+
+    @server.tool(
+        name="find_documents",
+        description=(
+            "Поиск документов в ЛОКАЛЬНОЙ базе geodocs по подстроке: номер,"
+            " название или муниципалитет. Возвращает version_id для"
+            " read_document_text/get_extractions."
+        ),
+    )
+    async def find_documents(
+        query: str, doc_type: str | None = None, limit: int = 10
+    ) -> dict[str, Any]:
+        return find_documents_impl(ctx, query, doc_type, limit)
+
+    @server.tool(
+        name="document_files",
+        description="Список файлов версии документа (пути, названия, размеры).",
+    )
+    async def document_files(version_id: int) -> dict[str, Any]:
+        return document_files_impl(ctx, version_id)
+
+    @server.tool(
+        name="read_document_text",
+        description=(
+            "Читает текст файла версии из локальной базы (PDF/DOCX/HTML)."
+            " Для длинных документов — порциями через max_chars."
+        ),
+    )
+    async def read_document_text(
+        version_id: int, file_index: int = 0, max_chars: int = 12_000
+    ) -> dict[str, Any]:
+        return read_document_text_impl(ctx, version_id, file_index, max_chars)
+
+    @server.tool(
+        name="get_extractions",
+        description=(
+            "Готовые структурированные фрагменты версии (таблицы ВРИ и др.),"
+            " извлечённые ранее. Проверяй ПЕРЕД чтением полного текста."
+        ),
+    )
+    async def get_extractions(version_id: int) -> dict[str, Any]:
+        return get_extractions_impl(ctx, version_id)
 
     return server
 

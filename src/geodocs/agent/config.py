@@ -1,6 +1,6 @@
 """Конфиг-реестр исполнителей агентного яруса: $GEODOCS_HOME/agents.yaml.
 
-Файл опционален: без него используются встроенные дефолты (chain из kimi).
+Файл опционален: без него используются встроенные дефолты (chain из hermes).
 Путь к файлу переопределяется env `GEODOCS_AGENTS_CONFIG`. Процессы
 короткоживущие, поэтому конфиг перечитывается при каждом запуске CLI.
 Дополнительные типы исполнителей регистрируются кодом
@@ -35,13 +35,13 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "retry_attempts": 2,
         "retry_pause_seconds": 60,
     },
-    "chain": ["kimi"],
+    "chain": ["hermes"],
     "executors": {
-        "kimi": {
-            "type": "kimi",
-            "command": "kimi",
-            "args": ["-p"],
-            "timeout_seconds": 900,
+        "hermes": {
+            "type": "hermes",
+            "command": "hermes",
+            "args": ["-z"],
+            "timeout_seconds": 2400,
             "quota_patterns": list(_DEFAULT_QUOTA_PATTERNS),
         },
     },

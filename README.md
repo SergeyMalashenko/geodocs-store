@@ -33,7 +33,7 @@ uv run ruff check src tests
 внешние LLM-агенты по одному на задачу: `geodocs-agent list|run|recover`.
 Исполнители сменные, порядок failover и квотные паттерны — в
 `$GEODOCS_HOME/agents.yaml` (env-override пути: `GEODOCS_AGENTS_CONFIG`;
-файл отсутствует — встроенный дефолт: один исполнитель `kimi`):
+файл отсутствует — встроенный дефолт: один исполнитель `hermes`):
 
 ```yaml
 defaults:
@@ -41,13 +41,13 @@ defaults:
   retry_attempts: 2        # полных проходов цепочки по задаче
   retry_pause_seconds: 60  # пауза между проходами
 run_after_sync: false      # читает внешний sync-harness (см. run_agent_tier)
-chain: [kimi]
+chain: [hermes]
 executors:
-  kimi:
-    type: kimi             # type определяет адаптер (см. рецепт ниже)
-    command: kimi
-    args: ["-p"]
-    timeout_seconds: 900
+  hermes:
+    type: hermes           # type определяет адаптер (см. рецепт ниже)
+    command: hermes
+    args: ["-z"]
+    timeout_seconds: 2400
     quota_patterns:        # regex по stdout+stderr неуспешного запуска
       - "(?i)quota"
       - "429"
@@ -61,7 +61,8 @@ executors:
 текущий запуск. Финальная неудача эскалирует в статус `manual_required`
 (result-JSON в `<GEODOCS_HOME>/agent/results/`), задача остаётся видна в
 `recover`. Провайдер реально успевшего исполнителя фиксируется в БД
-(`kimi-agent`; recover-приём — `manual`).
+(`hermes-agent`; recover-приём — `manual`; `kimi-agent` — provenance
+архивных записей прежнего backend).
 
 ```bash
 GEODOCS_HOME=$HOME/.geodocs uv run geodocs-agent run [--chain <имена из agents.yaml>] \
@@ -85,7 +86,7 @@ register_executor_type("myagent", MyAgentExecutor)
 ```
 
 ```yaml
-chain: [kimi, myagent]
+chain: [hermes, myagent]
 executors:
   myagent:
     type: myagent
@@ -100,15 +101,19 @@ executors:
 с нуля и бросает `QuotaExceeded` при исчерпании квоты — цепочка сама
 переключится на следующего исполнителя.
 
-### Kimi harness: статические инструменты вместо свободного веб-поиска
+### Hermes harness: статические инструменты вместо свободного веб-поиска
 
-KimiExecutor перед запуском материализует в рабочем каталоге задачи
-(GEODOCS_HOME) `.kimi-code/mcp.json` — stdio MCP-сервер `geodocs-agent-mcp`
-(`python -m geodocs.agent.mcp`, зависимость extra: `pip install 'geodocs[mcp]'`),
-гарантирует workspace-trust каталога для Kimi CLI и добавляет в argv
-`--skills-dir` с пакетными скилами. Агент работает по промпту строго в
-порядке: локальная база → инструменты порталов → скачивание → свободный
-веб-поиск (последнее звено) → MANIFEST.
+HermesExecutor на каждую задачу материализует изолированный HERMES_HOME
+(`<GEODOCS_HOME>/.hermes-home/<slug>`): `config.yaml` — копия конфига
+основного профиля (`$HERMES_HOME/config.yaml`, по умолчанию
+`~/.hermes/config.yaml`) с пропатченным `mcp_servers.geodocs` (stdio
+MCP-сервер `geodocs-agent-mcp`, `python -m geodocs.agent.mcp`, зависимость
+extra: `pip install 'geodocs[mcp]'`); `auth.json`/`.env` — симлинки на
+основной профиль (креды провайдера и `FIRECRAWL_API_KEY`); `skills/` —
+копии пакетных скилов. Запуск — `hermes -z <промт>` с `--accept-hooks` и
+`--skills`. Агент работает по промпту строго в порядке: локальная база →
+инструменты порталов → скачивание → свободный веб-поиск штатными
+веб-инструментами Hermes (Firecrawl, последнее звено) → MANIFEST.
 
 Инструменты MCP (параллельный поиск, ошибка одного портала не роняет
 остальные):
@@ -119,6 +124,33 @@ KimiExecutor перед запуском материализует в рабо�
 | `search_document` | Поиск по всем порталам реестра, merged-кандидаты с тегами |
 | `download_document` | Скачивание в inbox задачи; HTML отклоняется |
 | `fetch_page` | HTML→текст + ссылки на файлы (муниципальные сайты без API) |
+| `find_documents` | Read-only: версии в базе по подстроке (номер/название/муниципалитет) |
+| `document_files` | Read-only: файлы версии |
+| `read_document_text` | Read-only: текст файла версии (PDF/DOCX/HTML), порциями |
+| `get_extractions` | Read-only: готовые структурированные фрагменты (таблицы ВРИ) |
+
+Read-only группа обслуживает Q&A поверх локальной базы — единый метод
+извлечения сведений из документов (см. ниже).
+
+### Q&A по локальной базе: `ask_document`
+
+Единый метод извлечения сведений из скачанных документов — свободный
+текстовый запрос, ответ агента, основанный только на базе:
+
+```bash
+GEODOCS_HOME=$HOME/.geodocs uv run geodocs-agent ask \
+    "Верни ВРИ для зоны СХ-2 городского округа Коломна"
+```
+
+```python
+from geodocs.agent import ask_document
+
+result = ask_document("Верни ВРИ для документа № 1198 Коломна")
+print(result.answer)   # ответ + источник (муниципалитет, №, дата, файл)
+```
+
+Агент сначала проверяет `get_extractions` (дешёвые статические экстракторы
+уже могли извлечь таблицу ВРИ), затем читает полный текст файлов.
 
 Порталы-доноры (`src/geodocs/agent/portals/`, регистрация —
 `register_portal`): **meganorm** (нормо-база; fetch отказывается сохранять

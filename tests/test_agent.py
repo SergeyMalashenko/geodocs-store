@@ -1,6 +1,6 @@
 """Тесты агентного яруса: задачи, промпт, гейт, запись в store, runner.
 
-Без сети и без реального kimi: внешний агент подменяется shell-скриптом.
+Без сети и без реального hermes: внешний агент подменяется shell-скриптом.
 """
 
 from __future__ import annotations
@@ -47,6 +47,17 @@ from geodocs.agent.cli import main, recover_pending
 
 MUNICIPALITY = "Городской округ Солнечногорск"
 AMENDMENT_DATE = "2026-04-09"
+
+
+@pytest.fixture(autouse=True)
+def _hermes_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """HermesExecutor читает профиль $HERMES_HOME: изолируем от реального ~/.hermes."""
+    profile = tmp_path / "hermes-src"
+    profile.mkdir()
+    (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+    (profile / "auth.json").write_text("{}", encoding="utf-8")
+    (profile / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +171,7 @@ def _record(path: Path) -> FileRecord:
     )
 
 
-def _fake_kimi(
+def _fake_agent(
     tmp_path: Path,
     inbox: Path,
     files: dict[str, bytes],
@@ -168,7 +179,7 @@ def _fake_kimi(
     *,
     no_manifest_echo: str | None = None,
 ) -> Path:
-    """Shell-заглушка kimi: копирует файлы в inbox и печатает манифест.
+    """Shell-заглушка агента: копирует файлы в inbox и печатает манифест.
 
     manifest=None имитирует агента, убитого до печати MANIFEST: вместо
     маркера — произвольная последняя строка `no_manifest_echo`.
@@ -191,7 +202,7 @@ def _fake_kimi(
         if files
         else ""
     )
-    script = tmp_path / f"fake_kimi_{staging.name}.sh"
+    script = tmp_path / f"fake_agent_{staging.name}.sh"
     script.write_text(
         "#!/bin/bash\n"
         "set -e\n"
@@ -207,16 +218,16 @@ def _fake_kimi(
 # Конфиг ровно на один проход: старые тесты раннера проверяют одиночный
 # запуск без retry и failover.
 _SINGLE_PASS = AgentTierConfig(
-    chain=["kimi"], executors={}, retry_attempts=1, retry_pause_seconds=0
+    chain=["hermes"], executors={}, retry_attempts=1, retry_pause_seconds=0
 )
 
 
-def _script_executor(script: Path, *, name: str = "kimi") -> Executor:
-    """Исполнитель type=kimi поверх shell-заглушки (промт передаётся аргументом)."""
+def _script_executor(script: Path, *, name: str = "hermes") -> Executor:
+    """Исполнитель type=hermes поверх shell-заглушки (промт передаётся аргументом)."""
     return build_executor(
         ExecutorConfig(
             name=name,
-            type="kimi",
+            type="hermes",
             command=str(script),
             args=[],
             timeout_seconds=60,
@@ -478,7 +489,7 @@ def test_record_agent_fetch_primary_and_sections(
     assert version.file_path == str(named)
     assert version.sha256 == hashlib.sha256(named.read_bytes()).hexdigest()
     assert version.fetch_status is FetchStatus.DOWNLOADED
-    assert version.source_provider is SourceName.KIMI_AGENT
+    assert version.source_provider is SourceName.HERMES_AGENT
     assert version.source_url == "https://solreg.ru/docs/944"
     assert version.fetched_at is not None
     assert version.fetched_at.isoformat() == fetched_at
@@ -493,7 +504,7 @@ def test_record_agent_fetch_primary_and_sections(
     assert sections["2026-04-09_приложение.pdf"] == "файл"
 
     refs = store.source_refs_for_version(version_id)
-    assert ("kimi-agent", "https://solreg.ru/docs/944") in refs
+    assert ("hermes-agent", "https://solreg.ru/docs/944") in refs
 
 
 def test_record_agent_fetch_idempotent(
@@ -511,7 +522,7 @@ def test_record_agent_fetch_idempotent(
 
     assert len(store.files_for_version(version_id)) == 1
     refs = store.source_refs_for_version(version_id)
-    assert refs.count(("kimi-agent", "https://solreg.ru/docs/944")) == 1
+    assert refs.count(("hermes-agent", "https://solreg.ru/docs/944")) == 1
 
 
 def test_record_agent_fetch_primary_fallbacks(
@@ -549,7 +560,7 @@ def test_record_agent_fetch_rejects_empty(store: DocumentStore) -> None:
 
 
 # ---------------------------------------------------------------------------
-# run_task с поддельным kimi
+# run_task с поддельным агентом
 # ---------------------------------------------------------------------------
 
 
@@ -559,7 +570,7 @@ def test_run_task_downloaded(
     task = list_pending_tasks(store, statuses=("not_found",))[0]
     home = store.db_path.parent
     inbox = home / "inbox" / task.slug
-    script = _fake_kimi(
+    script = _fake_agent(
         tmp_path,
         inbox,
         {
@@ -599,7 +610,7 @@ def test_run_task_downloaded(
     )
     assert version is not None
     assert version.fetch_status is FetchStatus.DOWNLOADED
-    assert version.source_provider is SourceName.KIMI_AGENT
+    assert version.source_provider is SourceName.HERMES_AGENT
     assert version.source_url == "https://solreg.ru/docs/944"
 
     stored = store.files_for_version(task.version_id)
@@ -625,7 +636,7 @@ def test_run_task_not_found_keeps_db(
 ) -> None:
     task = list_pending_tasks(store, statuses=("not_found",))[0]
     home = store.db_path.parent
-    script = _fake_kimi(
+    script = _fake_agent(
         tmp_path,
         home / "inbox" / task.slug,
         {},
@@ -659,7 +670,7 @@ def test_run_task_gate_failed_keeps_db(
 ) -> None:
     task = list_pending_tasks(store, statuses=("not_found",))[0]
     home = store.db_path.parent
-    script = _fake_kimi(
+    script = _fake_agent(
         tmp_path,
         home / "inbox" / task.slug,
         {"2026-04-09_решение.pdf": "совсем не pdf".encode()},
@@ -693,7 +704,7 @@ def test_run_task_agent_error_no_manifest(
 ) -> None:
     task = list_pending_tasks(store, statuses=("not_found",))[0]
     home = store.db_path.parent
-    script = tmp_path / "silent_kimi.sh"
+    script = tmp_path / "silent_agent.sh"
     script.write_text("#!/bin/bash\necho 'работал, но ничего не нашел'\n", encoding="utf-8")
     script.chmod(0o755)
 
@@ -725,7 +736,7 @@ def test_run_task_recovers_valid_inbox_without_manifest(
     """Агент скачал файлы, но умер до печати MANIFEST — дожим по уликам inbox."""
     task = list_pending_tasks(store, statuses=("not_found",))[0]
     home = store.db_path.parent
-    script = _fake_kimi(
+    script = _fake_agent(
         tmp_path,
         home / "inbox" / task.slug,
         {"2026-04-09_решение.pdf": _pdf_bytes()},
@@ -754,10 +765,10 @@ def test_run_task_recovers_valid_inbox_without_manifest(
     )
     assert version is not None
     assert version.fetch_status is FetchStatus.DOWNLOADED
-    assert version.source_provider is SourceName.KIMI_AGENT
+    assert version.source_provider is SourceName.HERMES_AGENT
     assert version.source_url is None  # URL из манифеста неизвестен
     assert len(store.files_for_version(task.version_id)) == 1
-    assert ("kimi-agent", "https://solreg.ru/docs/944") not in (
+    assert ("hermes-agent", "https://solreg.ru/docs/944") not in (
         store.source_refs_for_version(task.version_id)
     )
 
@@ -776,7 +787,7 @@ def test_run_task_broken_inbox_without_manifest_escalates(
     """Файлы из inbox не проходят гейт — финальный статус manual_required."""
     task = list_pending_tasks(store, statuses=("not_found",))[0]
     home = store.db_path.parent
-    script = _fake_kimi(
+    script = _fake_agent(
         tmp_path,
         home / "inbox" / task.slug,
         {"2026-04-09_решение.pdf": b"tiny"},
@@ -813,7 +824,7 @@ def test_run_pending_limit_and_pause(
 ) -> None:
     home = store.db_path.parent
     first = list_pending_tasks(store)[0]
-    script = _fake_kimi(
+    script = _fake_agent(
         tmp_path,
         home / "inbox" / first.slug,
         {"2026-04-09_решение.pdf": _pdf_bytes()},
@@ -825,7 +836,7 @@ def test_run_pending_limit_and_pause(
     results = run_pending(
         store,
         limit=1,
-        executors={"kimi": _script_executor(script)},
+        executors={"hermes": _script_executor(script)},
         config=_SINGLE_PASS,
         geodocs_home=home,
     )
@@ -842,7 +853,7 @@ def test_run_pending_polite_pause_between_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = store.db_path.parent
-    script = _fake_kimi(
+    script = _fake_agent(
         tmp_path,
         home / "inbox" / "unused",
         {},
@@ -853,7 +864,7 @@ def test_run_pending_polite_pause_between_tasks(
 
     results = run_pending(
         store,
-        executors={"kimi": _script_executor(script)},
+        executors={"hermes": _script_executor(script)},
         config=_SINGLE_PASS,
         geodocs_home=home,
     )
@@ -972,7 +983,7 @@ def test_cli_recover_via_main(
 def test_record_agent_fetch_source_url_none(
     store: DocumentStore, tmp_path: Path
 ) -> None:
-    """URL неизвестен (recover): версия принята, source_url сохранён, provenance без kimi-agent."""
+    """URL неизвестен (recover): версия принята, source_url сохранён, provenance без hermes-agent."""
     version_id = store.register_ref(_ref("944", AMENDMENT_DATE))
     store.set_fetch_status(version_id, FetchStatus.NOT_FOUND)
     store.record_agent_fetch(
@@ -989,10 +1000,10 @@ def test_record_agent_fetch_source_url_none(
     )
     assert version is not None
     assert version.fetch_status is FetchStatus.DOWNLOADED
-    assert version.source_provider is SourceName.KIMI_AGENT
+    assert version.source_provider is SourceName.HERMES_AGENT
     assert version.source_url is None
     assert all(
-        source != "kimi-agent" for source in store.sources_for_version(version_id)
+        source != "hermes-agent" for source in store.sources_for_version(version_id)
     )
 
     # повторный вызов с реальным URL уже фиксирует provenance

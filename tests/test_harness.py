@@ -1,16 +1,14 @@
-"""Тесты пилота «Kimi Harness со статическими инструментами».
+"""Тесты пилота «Hermes Harness со статическими инструментами».
 
 Покрывает: реестр и адаптеры порталов (HTTP мокается respx), MCP-хендлеры
-(in-process, без транспорта), skills-валидацию, wiring KimiExecutor
-(mcp.json/workspace-trust/--skills-dir) и порядок инструментов в промпте.
+(in-process, без транспорта), skills-валидацию, wiring HermesExecutor
+(.hermes-home/<slug>/config.yaml, ссылки на auth.json/.env профиля, --skills)
+и порядок инструментов в промпте.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import hashlib
-import json
-import os
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -30,7 +28,7 @@ from geodocs import (
     FetchStatus,
     SourceName,
 )
-from geodocs.agent import MANIFEST_MARKER, KimiExecutor, run_pending
+from geodocs.agent import MANIFEST_MARKER, HermesExecutor, run_pending
 from geodocs.agent.config import ExecutorConfig
 from geodocs.agent.mcp import (
     McpContext,
@@ -108,6 +106,17 @@ _MUNICIPAL_PAGE = """
 <a href="/docs/map_1069.png">Карта</a>
 </body></html>
 """
+
+
+@pytest.fixture(autouse=True)
+def _hermes_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """HermesExecutor читает профиль $HERMES_HOME: изолируем от реального ~/.hermes."""
+    profile = tmp_path / "hermes-src"
+    profile.mkdir()
+    (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+    (profile / "auth.json").write_text("{}", encoding="utf-8")
+    (profile / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
 
 
 @pytest.fixture()
@@ -543,17 +552,25 @@ def test_skills_frontmatter_valid() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Wiring: KimiExecutor материализует mcp.json/trust и argv скилов
+# Wiring: HermesExecutor материализует .hermes-home (config.yaml/креды/скилы)
 # ---------------------------------------------------------------------------
 
 
-def _kimi_cfg(**overrides: Any) -> ExecutorConfig:
+_PACKAGE_SKILLS = (
+    "cntd-search",
+    "document-requisites",
+    "meganorm-search",
+    "municipal-navigation",
+)
+
+
+def _hermes_cfg(**overrides: Any) -> ExecutorConfig:
     values: dict[str, Any] = {
-        "name": "kimi",
-        "type": "kimi",
-        "command": "kimi",
-        "args": ["-p"],
-        "timeout_seconds": 900,
+        "name": "hermes",
+        "type": "hermes",
+        "command": "hermes",
+        "args": ["-z"],
+        "timeout_seconds": 2400,
         "quota_patterns": [],
     }
     values.update(overrides)
@@ -564,61 +581,68 @@ def _prompt(inbox: Path) -> str:
     return f"Тест. СКАЧИВАНИЕ: каталог {inbox} (mkdir -p)."
 
 
-def test_kimi_executor_materializes_mcp_and_skills(
+def _stub_run(seen: list[dict[str, Any]]) -> Any:
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.append({"argv": argv, **kwargs})
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="ok", stderr=""
+        )
+
+    return fake_run
+
+
+def test_hermes_executor_materializes_config_and_skills(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    kimi_home = tmp_path / "kimi-home"
-    monkeypatch.setenv("KIMI_HOME", str(kimi_home))
+    source_profile = tmp_path / "hermes-src"  # из autouse-фикстуры
     workdir = tmp_path / "workdir"  # рабочий каталог задачи — НЕ home базы
     home = tmp_path / "geodocs-home"
     inbox = workdir / "inbox" / "pzz_1069"
     workdir.mkdir(parents=True)
 
-    argv_seen: list[list[str]] = []
-
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        argv_seen.append(argv)
-        return subprocess.CompletedProcess(
-            args=argv, returncode=0, stdout="ok", stderr=""
-        )
-
-    monkeypatch.setattr("geodocs.agent.executors.subprocess.run", fake_run)
-    executor = KimiExecutor(dataclasses.replace(_kimi_cfg(), home=home))
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr("geodocs.agent.executors.subprocess.run", _stub_run(seen))
+    executor = HermesExecutor(dataclasses.replace(_hermes_cfg(), home=home))
     result = executor.run(_prompt(inbox), workdir)
 
     assert result.returncode == 0
-    # argv: kimi --skills-dir <пакетные скилы> -p <промт>
-    argv = argv_seen[0]
-    assert argv[0] == "kimi"
-    skills_index = argv.index("--skills-dir")
-    assert Path(argv[skills_index + 1]).name == "skills"
-    assert argv.index("-p") > skills_index  # флаги до -p
+    # argv: hermes --accept-hooks --skills <имена> -z <промт>
+    argv = seen[0]["argv"]
+    assert argv[0] == "hermes"
+    assert "--accept-hooks" in argv
+    skills_index = argv.index("--skills")
+    assert argv[skills_index + 1].split(",") == list(_PACKAGE_SKILLS)
+    assert argv.index("-z") > skills_index  # флаги до args и промта
     assert argv[-1].startswith("Тест.")
 
-    mcp_config = json.loads(
-        (workdir / ".kimi-code" / "mcp.json").read_text(encoding="utf-8")
-    )
-    server = mcp_config["mcpServers"]["geodocs"]
+    # изолированный HERMES_HOME: slug — имя inbox из промта
+    hermes_home = workdir / ".hermes-home" / "pzz_1069"
+    config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    server = config["mcp_servers"]["geodocs"]
+    assert server["enabled"] is True
     assert server["command"] == sys.executable
     assert server["args"] == ["-m", "geodocs.agent.mcp"]
     # GEODOCS_HOME — общая база из конфига исполнителя, не рабочий каталог
     assert server["env"]["GEODOCS_HOME"] == str(home)
     assert server["env"]["GEODOCS_AGENT_INBOX"] == str(inbox)
 
-    # workspace-trust для workdir создан в изолированном KIMI_HOME
-    digest = hashlib.sha256(os.path.realpath(workdir).encode()).hexdigest()[:12]
-    trust_file = kimi_home / "workspace-trust" / f"wd_workdir_{digest}"
-    assert trust_file.exists()
-    assert json.loads(trust_file.read_text(encoding="utf-8"))[
-        "root"
-    ] == os.path.realpath(workdir)
+    # креды основного профиля — симлинки, не копии
+    assert (hermes_home / "auth.json").is_symlink()
+    assert (hermes_home / "auth.json").resolve() == source_profile / "auth.json"
+    assert (hermes_home / ".env").is_symlink()
+
+    # пакетные скилы скопированы в изолированный профиль
+    for skill in _PACKAGE_SKILLS:
+        assert (hermes_home / "skills" / skill / "SKILL.md").is_file()
+
+    # subprocess получает HERMES_HOME материализованного профиля
+    assert seen[0]["env"]["HERMES_HOME"] == str(hermes_home)
 
 
 def test_runner_passes_home_and_mcp_check_local_store_sees_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Сквозная проводка: раннер подставляет home → mcp.json → check_local_store."""
-    monkeypatch.setenv("KIMI_HOME", str(tmp_path / "kimi-home"))
+    """Сквозная проводка: раннер подставляет home → config.yaml → check_local_store."""
     home = tmp_path / "home"
     store = DocumentStore(home / "geodocs.sqlite3", files_dir=home / "files")
     version_id = store.register_ref(
@@ -646,13 +670,13 @@ def test_runner_passes_home_and_mcp_check_local_store_sees_it(
     from geodocs.agent import AgentTierConfig
 
     config = AgentTierConfig(
-        chain=["kimi"],
+        chain=["hermes"],
         executors={
-            "kimi": ExecutorConfig(
-                name="kimi",
-                type="kimi",
-                command="kimi",
-                args=["-p"],
+            "hermes": ExecutorConfig(
+                name="hermes",
+                type="hermes",
+                command="hermes",
+                args=["-z"],
                 timeout_seconds=60,
                 quota_patterns=[],
             )
@@ -664,13 +688,13 @@ def test_runner_passes_home_and_mcp_check_local_store_sees_it(
     store.close()
 
     assert [r.status for r in results] == ["not_found"]
-    mcp_config = json.loads(
-        (home / ".kimi-code" / "mcp.json").read_text(encoding="utf-8")
-    )
-    env = mcp_config["mcpServers"]["geodocs"]["env"]
+    # slug = имя inbox из промта (build_prompt → «каталог <home>/inbox/pzz_1069»)
+    hermes_home = home / ".hermes-home" / "pzz_1069"
+    mcp_config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    env = mcp_config["mcp_servers"]["geodocs"]["env"]
     assert env["GEODOCS_HOME"] == str(home)  # не рабочий каталог, а home базы
 
-    # хендлер с окружением из mcp.json видит версию реального хранилища
+    # хендлер с окружением из config.yaml видит версию реального хранилища
     ctx = McpContext(
         inbox=Path(env["GEODOCS_AGENT_INBOX"]), home=Path(env["GEODOCS_HOME"])
     )
@@ -679,54 +703,49 @@ def test_runner_passes_home_and_mcp_check_local_store_sees_it(
     assert found["versions"][0]["fetch_status"] == "not_found"
 
 
-def test_kimi_executor_mcp_disabled(
+def test_hermes_executor_mcp_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("KIMI_HOME", str(tmp_path / "kimi-home"))
     workdir = tmp_path / "home"
     inbox = workdir / "inbox" / "pzz_1"
     workdir.mkdir(parents=True)
 
-    argv_seen: list[list[str]] = []
-
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        argv_seen.append(argv)
-        return subprocess.CompletedProcess(
-            args=argv, returncode=0, stdout="ok", stderr=""
-        )
-
-    monkeypatch.setattr("geodocs.agent.executors.subprocess.run", fake_run)
-    executor = KimiExecutor(_kimi_cfg(mcp=False))
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr("geodocs.agent.executors.subprocess.run", _stub_run(seen))
+    executor = HermesExecutor(_hermes_cfg(mcp=False))
     executor.run(_prompt(inbox), workdir)
 
-    assert not (workdir / ".kimi-code" / "mcp.json").exists()
-    assert "--skills-dir" in argv_seen[0]  # скилы независимы от mcp
+    hermes_home = workdir / ".hermes-home" / "pzz_1"
+    assert not (hermes_home / "config.yaml").exists()  # MCP отключён
+    # скилы и креды материализуются независимо от mcp
+    for skill in _PACKAGE_SKILLS:
+        assert (hermes_home / "skills" / skill / "SKILL.md").is_file()
+    assert (hermes_home / "auth.json").is_symlink()
+    assert "--skills" in seen[0]["argv"]
 
 
-def test_kimi_executor_extra_skills_dirs_from_config(
+def test_hermes_executor_extra_skills_dirs_from_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("KIMI_HOME", str(tmp_path / "kimi-home"))
     extra = tmp_path / "extra-skills"
-    extra.mkdir()
+    (extra / "custom-skill").mkdir(parents=True)
+    (extra / "custom-skill" / "SKILL.md").write_text(
+        "---\nname: custom-skill\n---\n", encoding="utf-8"
+    )
     workdir = tmp_path / "home"
     workdir.mkdir(parents=True)
 
-    argv_seen: list[list[str]] = []
-
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        argv_seen.append(argv)
-        return subprocess.CompletedProcess(
-            args=argv, returncode=0, stdout="ok", stderr=""
-        )
-
-    monkeypatch.setattr("geodocs.agent.executors.subprocess.run", fake_run)
-    executor = KimiExecutor(_kimi_cfg(skills_dirs=[str(extra)], mcp=False))
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr("geodocs.agent.executors.subprocess.run", _stub_run(seen))
+    executor = HermesExecutor(_hermes_cfg(skills_dirs=[str(extra)], mcp=False))
     executor.run(_prompt(workdir / "inbox" / "pzz_1"), workdir)
 
-    argv = argv_seen[0]
-    assert argv.count("--skills-dir") == 2
-    assert str(extra) in argv
+    argv = seen[0]["argv"]
+    names = argv[argv.index("--skills") + 1].split(",")
+    assert "custom-skill" in names  # поверх пакетных
+    hermes_home = workdir / ".hermes-home" / "pzz_1"
+    assert (hermes_home / "skills" / "custom-skill" / "SKILL.md").is_file()
+    assert not (hermes_home / "config.yaml").exists()  # mcp: false
 
 
 def test_config_parses_skills_dirs_and_mcp(
@@ -737,10 +756,10 @@ def test_config_parses_skills_dirs_and_mcp(
     (home / "agents.yaml").write_text(
         yaml.dump(
             {
-                "chain": ["kimi"],
+                "chain": ["hermes"],
                 "executors": {
-                    "kimi": {
-                        "type": "kimi",
+                    "hermes": {
+                        "type": "hermes",
                         "skills_dirs": ["/opt/skills"],
                         "mcp": {"enabled": False},
                     }
@@ -751,8 +770,8 @@ def test_config_parses_skills_dirs_and_mcp(
     )
     monkeypatch.delenv("GEODOCS_AGENTS_CONFIG", raising=False)
     cfg = load_config(home)
-    assert cfg.executors["kimi"].skills_dirs == ["/opt/skills"]
-    assert cfg.executors["kimi"].mcp is False
+    assert cfg.executors["hermes"].skills_dirs == ["/opt/skills"]
+    assert cfg.executors["hermes"].mcp is False
 
 
 def test_config_rejects_bad_skills_dirs(
@@ -761,7 +780,7 @@ def test_config_rejects_bad_skills_dirs(
     from geodocs.agent import AgentConfigError, load_config
 
     (home / "agents.yaml").write_text(
-        "chain: [kimi]\nexecutors:\n  kimi:\n    type: kimi\n    skills_dirs: not-a-list\n",
+        "chain: [hermes]\nexecutors:\n  hermes:\n    type: hermes\n    skills_dirs: not-a-list\n",
         encoding="utf-8",
     )
     monkeypatch.delenv("GEODOCS_AGENTS_CONFIG", raising=False)

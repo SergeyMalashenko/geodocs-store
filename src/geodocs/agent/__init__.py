@@ -1,5 +1,6 @@
 """Агентный ярус документного поиска: внешние агенты добирают не найденное статикой."""
 
+from .ask import AskResult, ask_document, build_ask_prompt
 from .config import (
     AgentConfigError,
     AgentTierConfig,
@@ -12,7 +13,7 @@ from .executors import (
     ExecutionTimeout,
     Executor,
     ExecutorError,
-    KimiExecutor,
+    HermesExecutor,
     QuotaExceeded,
     build_executor,
     register_executor_type,
@@ -37,15 +38,18 @@ __all__ = [
     "AgentConfigError",
     "AgentTask",
     "AgentTierConfig",
+    "AskResult",
     "ExecutionResult",
     "ExecutionTimeout",
     "Executor",
     "ExecutorConfig",
     "ExecutorError",
     "FileVerdict",
-    "KimiExecutor",
+    "HermesExecutor",
     "QuotaExceeded",
     "TaskResult",
+    "ask_document",
+    "build_ask_prompt",
     "build_executor",
     "build_prompt",
     "default_config",
