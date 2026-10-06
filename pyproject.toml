@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.10",
+    "pyyaml>=6.0.3",
 ]
 
 [project.scripts]

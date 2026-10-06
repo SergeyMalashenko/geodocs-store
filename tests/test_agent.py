@@ -29,7 +29,11 @@ from geodocs import (
 from geodocs.agent import (
     MANIFEST_MARKER,
     AgentTask,
+    AgentTierConfig,
+    Executor,
+    ExecutorConfig,
     FileVerdict,
+    build_executor,
     build_prompt,
     doc_type_ru,
     gate_pass,
@@ -198,6 +202,27 @@ def _fake_kimi(
     )
     script.chmod(0o755)
     return script
+
+
+# Конфиг ровно на один проход: старые тесты раннера проверяют одиночный
+# запуск без retry и failover.
+_SINGLE_PASS = AgentTierConfig(
+    chain=["kimi"], executors={}, retry_attempts=1, retry_pause_seconds=0
+)
+
+
+def _script_executor(script: Path, *, name: str = "kimi") -> Executor:
+    """Исполнитель type=kimi поверх shell-заглушки (промт передаётся аргументом)."""
+    return build_executor(
+        ExecutorConfig(
+            name=name,
+            type="kimi",
+            command=str(script),
+            args=[],
+            timeout_seconds=60,
+            quota_patterns=[],
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +566,13 @@ def test_run_task_downloaded(
         },
     )
 
-    result = run_task(task, store, kimi_bin=str(script), geodocs_home=home)
+    result = run_task(
+        task,
+        store,
+        executors=[_script_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
 
     assert result.status == "downloaded"
     assert result.error is None
@@ -592,7 +623,13 @@ def test_run_task_not_found_keeps_db(
         {"status": "not_found", "source_url": "", "notes": "только платный источник"},
     )
 
-    result = run_task(task, store, kimi_bin=str(script), geodocs_home=home)
+    result = run_task(
+        task,
+        store,
+        executors=[_script_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
 
     assert result.status == "not_found"
     assert result.error is None
@@ -620,9 +657,15 @@ def test_run_task_gate_failed_keeps_db(
         {"status": "found", "source_url": "https://solreg.ru/bad"},
     )
 
-    result = run_task(task, store, kimi_bin=str(script), geodocs_home=home)
+    result = run_task(
+        task,
+        store,
+        executors=[_script_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
 
-    assert result.status == "gate_failed"
+    assert result.status == "manual_required"  # финальная неудача эскалирует
     assert result.error
     assert not all(v.ok for v in result.verdicts)
     version = store.find_version(
@@ -645,9 +688,15 @@ def test_run_task_agent_error_no_manifest(
     script.write_text("#!/bin/bash\necho 'работал, но ничего не нашел'\n", encoding="utf-8")
     script.chmod(0o755)
 
-    result = run_task(task, store, kimi_bin=str(script), geodocs_home=home)
+    result = run_task(
+        task,
+        store,
+        executors=[_script_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
 
-    assert result.status == "agent_error"
+    assert result.status == "manual_required"  # финальная неудача эскалирует
     assert result.manifest is None
     assert result.error
     assert result.stdout_tail and "ничего не нашел" in result.stdout_tail
@@ -675,7 +724,13 @@ def test_run_task_recovers_valid_inbox_without_manifest(
         no_manifest_echo="квота исчерпана, падаю",
     )
 
-    result = run_task(task, store, kimi_bin=str(script), geodocs_home=home)
+    result = run_task(
+        task,
+        store,
+        executors=[_script_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
 
     assert result.status == "downloaded"
     assert result.manifest is None
@@ -706,10 +761,10 @@ def test_run_task_recovers_valid_inbox_without_manifest(
     assert saved["stdout_tail"]
 
 
-def test_run_task_broken_inbox_without_manifest_stays_agent_error(
+def test_run_task_broken_inbox_without_manifest_escalates(
     store: DocumentStore, seeded: dict[str, int], tmp_path: Path
 ) -> None:
-    """Файлы из inbox не проходят гейт — прежнее поведение: agent_error."""
+    """Файлы из inbox не проходят гейт — финальный статус manual_required."""
     task = list_pending_tasks(store, statuses=("not_found",))[0]
     home = store.db_path.parent
     script = _fake_kimi(
@@ -719,9 +774,15 @@ def test_run_task_broken_inbox_without_manifest_stays_agent_error(
         None,
     )
 
-    result = run_task(task, store, kimi_bin=str(script), geodocs_home=home)
+    result = run_task(
+        task,
+        store,
+        executors=[_script_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
 
-    assert result.status == "agent_error"
+    assert result.status == "manual_required"
     assert result.manifest is None
     assert result.error and "MANIFEST" in result.error
     version = store.find_version(
@@ -753,7 +814,11 @@ def test_run_pending_limit_and_pause(
     monkeypatch.setattr("geodocs.agent.runner.time.sleep", sleeps.append)
 
     results = run_pending(
-        store, limit=1, kimi_bin=str(script), geodocs_home=home
+        store,
+        limit=1,
+        executors={"kimi": _script_executor(script)},
+        config=_SINGLE_PASS,
+        geodocs_home=home,
     )
 
     assert len(results) == 1
@@ -777,7 +842,12 @@ def test_run_pending_polite_pause_between_tasks(
     sleeps: list[float] = []
     monkeypatch.setattr("geodocs.agent.runner.time.sleep", sleeps.append)
 
-    results = run_pending(store, kimi_bin=str(script), geodocs_home=home)
+    results = run_pending(
+        store,
+        executors={"kimi": _script_executor(script)},
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
 
     assert len(results) == 2  # not_found + pending
     assert sleeps == [5.0]  # пауза ровно между двумя задачами
@@ -816,7 +886,7 @@ def test_recover_pending_recovers_and_skips(
     )
     assert version is not None
     assert version.fetch_status is FetchStatus.DOWNLOADED
-    assert version.source_provider is SourceName.KIMI_AGENT
+    assert version.source_provider is SourceName.MANUAL  # принято через recover
     assert len(store.files_for_version(seeded["not_found"])) == 1
     # pending-задача с пустым inbox осталась нетронутой
     still_pending = store.find_version(

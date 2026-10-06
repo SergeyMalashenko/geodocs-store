@@ -516,19 +516,22 @@ class DocumentStore:
         files: list[FileRecord],
         source_url: str | None,
         fetched_at: str,
+        source_provider: SourceName = SourceName.KIMI_AGENT,
     ) -> None:
         """Фиксирует результат агентного яруса одной транзакцией.
 
         Первичным файлом редакции становится первый PDF с «изменен»/«решение»
         в имени, иначе первый PDF, иначе первый файл. Набор `version_files`
         версии заменяется целиком, provenance дополняется источником
-        kimi-agent. `source_url=None` означает, что URL неизвестен (приём
-        готовых файлов из inbox без манифеста): прежний source_url версии
-        сохраняется, запись provenance не добавляется (source_object_id
-        обязателен в схеме). Повторный вызов с теми же файлами идемпотентен.
+        `source_provider` (kimi-agent/hermes-agent — добыт исполнителем,
+        manual — принят из inbox вручную через recover). `source_url=None`
+        означает, что URL неизвестен: прежний source_url версии сохраняется,
+        запись provenance не добавляется (source_object_id обязателен в схеме).
+        Повторный вызов с теми же файлами идемпотентен.
         """
         if not files:
             raise ValueError("files не должен быть пустым")
+        provider = SourceName(source_provider)
         primary = _primary_agent_file(files)
         with self.connection:
             self.connection.execute(
@@ -540,7 +543,7 @@ class DocumentStore:
                     primary.path,
                     primary.sha256,
                     source_url,
-                    SourceName.KIMI_AGENT.value,
+                    provider.value,
                     FetchStatus.DOWNLOADED.value,
                     fetched_at,
                     version_id,
@@ -571,7 +574,7 @@ class DocumentStore:
                     "INSERT INTO document_sources"
                     " (version_id, source, source_object_id, discovered_at)"
                     " VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                    (version_id, SourceName.KIMI_AGENT.value, source_url, fetched_at),
+                    (version_id, provider.value, source_url, fetched_at),
                 )
 
     def upsert_extraction(
@@ -676,6 +679,21 @@ class DocumentStore:
             " JOIN parcel_documents p ON p.version_id = v.id"
             " WHERE p.cadastral_number = ? ORDER BY v.id",
             (cadastral_number,),
+        ).fetchall()
+        return [DocumentVersionRecord(**_row_dict(row)) for row in rows]
+
+    def unlinked_versions_for_municipality(
+        self, municipality: str, cadastral_number: str
+    ) -> list[DocumentVersionRecord]:
+        """Версии документов муниципалитета, ещё не привязанные к кадастровому номеру."""
+        rows = self.connection.execute(
+            "SELECT v.* FROM document_versions v"
+            " JOIN documents d ON d.id = v.document_id"
+            " WHERE d.municipality = ?"
+            " AND NOT EXISTS (SELECT 1 FROM parcel_documents p"
+            " WHERE p.version_id = v.id AND p.cadastral_number = ?)"
+            " ORDER BY v.id",
+            (municipality, cadastral_number),
         ).fetchall()
         return [DocumentVersionRecord(**_row_dict(row)) for row in rows]
 

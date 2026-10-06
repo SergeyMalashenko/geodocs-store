@@ -1,22 +1,31 @@
-"""Запуск внешнего агента (KIMI CLI) по задачам и приём результата в geodocs."""
+"""Запуск внешних агентов по задачам: failover-цепочка исполнителей и приём результата."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import shlex
+import os
 import shutil
-import subprocess
+import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from ..models import FileRecord
+from ..models import FileRecord, SourceName
 from ..store import DocumentStore
+from .config import AgentTierConfig, load_config
+from .executors import (
+    ExecutionTimeout,
+    Executor,
+    ExecutorError,
+    QuotaExceeded,
+    build_executor,
+)
 from .gate import FileVerdict, gate_pass, verify_files
 from .prompt import build_prompt
 from .tasks import AgentTask, list_pending_tasks
@@ -25,11 +34,17 @@ MANIFEST_MARKER = "=== MANIFEST ==="
 _POLITE_DELAY_S = 5
 _TAIL_LEN = 1000
 
-TaskStatus = Literal["downloaded", "not_found", "agent_error", "gate_failed"]
+TaskStatus = Literal[
+    "downloaded",
+    "not_found",
+    "agent_error",
+    "gate_failed",
+    "manual_required",
+]
 
 
 class TaskResult(BaseModel):
-    """Итог прогона одной задачи через внешнего агента."""
+    """Итог прогона одной задачи через цепочку внешних агентов."""
 
     task: AgentTask
     manifest: dict[str, Any] | None
@@ -39,6 +54,29 @@ class TaskResult(BaseModel):
     duration_s: float
     stdout_tail: str | None = None
     stderr_tail: str | None = None
+    executor: str | None = None
+    attempts: int = 1
+    quota_exhausted: list[str] = []
+
+
+class _QuotaTracker:
+    """Исполнители, исчерпавшие квоту в текущем запуске: общие для всех потоков."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._exhausted: set[str] = set()
+
+    def mark(self, name: str) -> None:
+        with self._lock:
+            self._exhausted.add(name)
+
+    def is_exhausted(self, name: str) -> bool:
+        with self._lock:
+            return name in self._exhausted
+
+    def snapshot(self) -> list[str]:
+        with self._lock:
+            return sorted(self._exhausted)
 
 
 def _utcnow() -> str:
@@ -154,6 +192,7 @@ def _gate_and_register(
     store: DocumentStore,
     task: AgentTask,
     source_url: str | None,
+    provider: SourceName,
 ) -> bool:
     """Общий шаг приёма: гейт по вердиктам и регистрация в БД. True = принято."""
     if not gate_pass(verdicts):
@@ -163,6 +202,7 @@ def _gate_and_register(
         files=[_file_record(path) for path in copied],
         source_url=source_url,
         fetched_at=_utcnow(),
+        source_provider=provider,
     )
     return True
 
@@ -199,22 +239,20 @@ def _save_result(home: Path, slug: str, result: TaskResult) -> Path:
     return out_path
 
 
-def run_task(
+def _attempt_with_executor(
     task: AgentTask,
     store: DocumentStore,
     *,
-    kimi_bin: str = "kimi",
-    timeout_s: int = 1800,
-    geodocs_home: Path | None = None,
+    executor: Executor,
+    home: Path,
 ) -> TaskResult:
-    """Запускает внешнего агента для одной задачи и фиксирует результат.
+    """Одна попытка одного исполнителя: промт → запуск → гейт → запись в БД.
 
-    При прохождении гейта версия переходит в downloaded (record_agent_fetch),
-    иначе состояние в БД не меняется, а причина — в TaskResult.error. Если
-    агент завершился без манифеста, но в inbox лежит валидный набор файлов,
-    результат дожимается детерминированно по уликам из inbox.
+    QuotaExceeded пробрасывается наружу (обрабатывает цепочка). Успех =
+    гейт принял inbox; версия переходит в downloaded (record_agent_fetch с
+    provider реально отработавшего исполнителя). Без манифеста, но с валидным
+    inbox результат дожимается по уликам из inbox.
     """
-    home = Path(geodocs_home) if geodocs_home is not None else store.db_path.parent
     inbox = inbox_dir(home, task)
     inbox.mkdir(parents=True, exist_ok=True)
     prompt = build_prompt(task, inbox)
@@ -228,40 +266,31 @@ def run_task(
     stderr_tail: str | None = None
 
     try:
-        proc = subprocess.run(
-            [kimi_bin, "-p", prompt],
-            cwd=str(home),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_s,
-            check=False,  # код возврата разбираем сами ниже
-        )
-    except subprocess.TimeoutExpired as exc:
-        error = f"агент не уложился в {timeout_s} с"
-        stdout_tail = _tail(exc.stdout)
-        stderr_tail = _tail(exc.stderr)
-    except OSError as exc:
-        error = f"не удалось запустить {shlex.quote(kimi_bin)}: {exc}"
+        exec_result = executor.run(prompt, home)
+    except ExecutionTimeout as exc:
+        error = str(exc)
+    except ExecutorError as exc:
+        error = str(exc)
     else:
-        stdout_tail = _tail(proc.stdout)
-        stderr_tail = _tail(proc.stderr)
-        if proc.returncode != 0:
+        stdout_tail = _tail(exec_result.stdout)
+        stderr_tail = _tail(exec_result.stderr)
+        if exec_result.returncode != 0:
             status = "agent_error"
             error = (
-                f"kimi завершился с кодом {proc.returncode}:"
-                f" {proc.stderr.strip()[:400]}"
+                f"{executor.name} завершился с кодом {exec_result.returncode}:"
+                f" {exec_result.stderr.strip()[:400]}"
             )
         else:
-            manifest = parse_manifest(proc.stdout)
+            manifest = parse_manifest(exec_result.stdout)
             if manifest is None:
                 # манифест потерян (типично: квота убила агента после
                 # скачивания) — принимаем по уликам из inbox
                 verdicts, copied = _collect_files(
                     _inbox_names(inbox), inbox, store, task
                 )
-                if _gate_and_register(verdicts, copied, store, task, None):
+                if _gate_and_register(
+                    verdicts, copied, store, task, None, executor.provider
+                ):
                     status = "downloaded"
                     error = "manifest missing; recovered from inbox evidence"
                 else:
@@ -276,7 +305,12 @@ def run_task(
                     _claimed_names(manifest), inbox, store, task
                 )
                 if _gate_and_register(
-                    verdicts, copied, store, task, _manifest_source_url(manifest)
+                    verdicts,
+                    copied,
+                    store,
+                    task,
+                    _manifest_source_url(manifest),
+                    executor.provider,
                 ):
                     status = "downloaded"
                 else:
@@ -286,7 +320,7 @@ def run_task(
                         or "агент не заявил ни одного файла"
                     )
 
-    result = TaskResult(
+    return TaskResult(
         task=task,
         manifest=manifest,
         verdicts=verdicts,
@@ -295,6 +329,117 @@ def run_task(
         duration_s=time.monotonic() - started,
         stdout_tail=stdout_tail,
         stderr_tail=stderr_tail,
+        executor=executor.name,
+    )
+
+
+def _single_pass_config() -> AgentTierConfig:
+    """Конфиг по умолчанию для run_task: один проход без пауз."""
+    return AgentTierConfig(chain=[], executors={}, retry_attempts=1, retry_pause_seconds=0)
+
+
+def _run_task_chained(
+    task: AgentTask,
+    store: DocumentStore,
+    *,
+    chain: Sequence[Executor],
+    config: AgentTierConfig,
+    tracker: _QuotaTracker,
+    home: Path,
+) -> TaskResult:
+    """Проходы по цепочке исполнителей: failover, пауза, retry до исчерпания.
+
+    Исполнитель, бросивший QuotaExceeded, вычёркивается трекером на весь
+    текущий запуск (для остальных задач его уже не звать). Финал: not_found,
+    если хотя бы один исполнители достоверно ответил «не найдено» и больше
+    не было ошибок, иначе manual_required (задача видна в recover).
+    """
+    started = time.monotonic()
+    notes: list[str] = []
+    quota_seen: list[str] = []
+    not_found_names: list[str] = []
+    last_executor: str | None = None
+    last_result: TaskResult | None = None
+    passes_done = 0
+
+    for attempt in range(1, config.retry_attempts + 1):
+        available = [ex for ex in chain if not tracker.is_exhausted(ex.name)]
+        if not available:
+            notes.append("все исполнители цепочки исчерпали квоту")
+            break
+        passes_done = attempt
+        for executor in available:
+            last_executor = executor.name
+            try:
+                result = _attempt_with_executor(
+                    task, store, executor=executor, home=home
+                )
+            except QuotaExceeded as exc:
+                tracker.mark(executor.name)
+                quota_seen.append(executor.name)
+                notes.append(str(exc))
+                continue
+            last_result = result
+            if result.status == "not_found":
+                not_found_names.append(executor.name)
+                continue
+            if result.status == "downloaded":
+                result.attempts = attempt
+                result.quota_exhausted = quota_seen
+                result.duration_s = time.monotonic() - started
+                return result
+            notes.append(f"{executor.name}: {result.error or result.status}")
+        if attempt < config.retry_attempts:
+            if not any(not tracker.is_exhausted(ex.name) for ex in chain):
+                notes.append("все исполнители цепочки исчерпали квоту")
+                break  # дальше некому дожимать: пауза не имеет смысла
+            time.sleep(config.retry_pause_seconds)
+
+    status: TaskStatus = "not_found" if not_found_names and not notes else "manual_required"
+    if status == "not_found" and last_result is not None:
+        # честный «не найдено»: возвращаем манифест последней попытки
+        last_result.attempts = passes_done
+        last_result.quota_exhausted = quota_seen
+        last_result.duration_s = time.monotonic() - started
+        return last_result
+    error: str | None = None
+    if status == "manual_required":
+        error = "; ".join(notes) or "исполнители недоступны"
+        if not_found_names:
+            error += f"; not_found от: {', '.join(not_found_names)}"
+    return TaskResult(
+        task=task,
+        manifest=None,
+        verdicts=list(last_result.verdicts) if last_result is not None else [],
+        status=status,
+        error=error,
+        duration_s=time.monotonic() - started,
+        stdout_tail=last_result.stdout_tail if last_result is not None else None,
+        stderr_tail=last_result.stderr_tail if last_result is not None else None,
+        executor=last_executor,
+        attempts=passes_done or config.retry_attempts,
+        quota_exhausted=quota_seen,
+    )
+
+
+def run_task(
+    task: AgentTask,
+    store: DocumentStore,
+    *,
+    executors: Sequence[Executor],
+    config: AgentTierConfig | None = None,
+    geodocs_home: Path | None = None,
+    quota_tracker: _QuotaTracker | None = None,
+) -> TaskResult:
+    """Запускает одну задачу через цепочку исполнителей и сохраняет result-JSON."""
+    home = Path(geodocs_home) if geodocs_home is not None else store.db_path.parent
+    result = _run_task_chained(
+        task,
+        store,
+        chain=list(executors),
+        config=config or _single_pass_config(),
+        tracker=quota_tracker or _QuotaTracker(),
+        home=home,
     )
     _save_result(home, task.slug, result)
     return result
@@ -309,14 +454,15 @@ def recover_inbox(
     """Детерминированный приём готовых файлов из inbox без запуска агента.
 
     Для задач, чьи агенты скачали файлы, но не дожили до печати манифеста.
-    source_url неизвестен — record_agent_fetch получает None.
+    source_url неизвестен — record_agent_fetch получает None, провайдер —
+    manual (файлы принял оператор через recover).
     """
     home = Path(geodocs_home) if geodocs_home is not None else store.db_path.parent
     inbox = inbox_dir(home, task)
     started = time.monotonic()
 
     verdicts, copied = _collect_files(_inbox_names(inbox), inbox, store, task)
-    if _gate_and_register(verdicts, copied, store, task, None):
+    if _gate_and_register(verdicts, copied, store, task, None, SourceName.MANUAL):
         status: TaskStatus = "downloaded"
         error: str | None = None
     else:
@@ -330,6 +476,7 @@ def recover_inbox(
         status=status,
         error=error,
         duration_s=time.monotonic() - started,
+        executor="recover",
     )
     _save_result(home, task.slug, result)
     return result
@@ -340,22 +487,115 @@ def run_pending(
     *,
     limit: int | None = None,
     statuses: Sequence[str] = ("not_found", "pending"),
-    **kwargs: Any,
+    geodocs_home: Path | None = None,
+    config: AgentTierConfig | None = None,
+    executors: Mapping[str, Executor] | None = None,
 ) -> list[TaskResult]:
-    """Последовательный прогон очереди задач с вежливой паузой между запусками."""
+    """Прогон очереди задач через цепочку исполнителей.
+
+    workers=1 — последовательно с вежливой паузой; workers>1 — потоки по
+    задачам (каждый со своим соединением SQLite), result-JSON пишутся строго
+    в порядке задач. Квота-исчерпания исполнителей общие на весь запуск.
+    """
+    home = Path(geodocs_home) if geodocs_home is not None else store.db_path.parent
+    cfg = config or load_config(home)
+    executor_map = (
+        {name: build_executor(entry) for name, entry in cfg.executors.items()}
+        if executors is None
+        else dict(executors)
+    )
+    chain = [executor_map[name] for name in cfg.chain if name in executor_map]
+    if not chain:
+        raise ValueError("ни один исполнитель из chain не построен")
+
     tasks = list_pending_tasks(store, statuses=tuple(statuses))
     if limit is not None:
         tasks = tasks[:limit]
-    results: list[TaskResult] = []
+    tracker = _QuotaTracker()
+
+    def work(index: int, task: AgentTask) -> tuple[int, TaskResult]:
+        # sqlite-соединение нельзя делить между потоками: в потоках — своя копия
+        local_store = (
+            DocumentStore(store.db_path, files_dir=store.files_dir)
+            if cfg.workers > 1
+            else store
+        )
+        try:
+            result = _run_task_chained(
+                task, local_store, chain=chain, config=cfg, tracker=tracker, home=home
+            )
+        finally:
+            if local_store is not store:
+                local_store.close()
+        return index, result
+
+    if not tasks:
+        print("нет задач в очереди", flush=True)
+        return []
+
+    if cfg.workers > 1:
+        with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
+            done = dict(pool.map(lambda item: work(*item), enumerate(tasks)))
+        results: list[TaskResult] = []
+        total = len(tasks)
+        for index, task in enumerate(tasks):
+            result = done[index]
+            _save_result(home, task.slug, result)
+            results.append(result)
+            print(f"[{index + 1}/{total}] {task.slug} ...", flush=True)
+            detail = f"{result.status} за {result.duration_s:.1f} с"
+            if result.error:
+                detail += f" ({result.error})"
+            if result.executor:
+                detail += f" [{result.executor}]"
+            print(f"    {detail}", flush=True)
+        return results
+
+    results = []
     total = len(tasks)
     for index, task in enumerate(tasks, start=1):
         print(f"[{index}/{total}] {task.slug} ...", flush=True)
-        result = run_task(task, store, **kwargs)
+        _, result = work(index - 1, task)
+        _save_result(home, task.slug, result)
         results.append(result)
         detail = f"{result.status} за {result.duration_s:.1f} с"
         if result.error:
             detail += f" ({result.error})"
+        if result.executor:
+            detail += f" [{result.executor}]"
         print(f"    {detail}", flush=True)
         if index < total:
             time.sleep(_POLITE_DELAY_S)
     return results
+
+
+def run_agent_tier(
+    home: str | Path | None = None,
+    *,
+    only_missing: bool = True,
+    limit: int | None = None,
+) -> list[TaskResult]:
+    """Точка входа агентного яруса для внешнего sync-harness.
+
+    `geodocs sync` живёт в другом репозитории: после синхронизации статики
+    он должен вызвать run_agent_tier(home, only_missing=True) — либо сам,
+    либо (run_after_sync: true в agents.yaml) через свою обвязку. only_missing
+    ограничивает очередь недобранными статусами загрузки.
+    """
+    home_path = (
+        Path(home).expanduser()
+        if home is not None
+        else Path(os.environ.get("GEODOCS_HOME", str(Path.home() / ".geodocs")))
+    )
+    store = DocumentStore(home_path / "geodocs.sqlite3", files_dir=home_path / "files")
+    try:
+        statuses = (
+            ("not_found", "pending")
+            if only_missing
+            else ("not_found", "pending", "download_failed", "search_failed")
+        )
+        return run_pending(
+            store, limit=limit, statuses=statuses, geodocs_home=home_path
+        )
+    finally:
+        store.close()

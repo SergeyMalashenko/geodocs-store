@@ -170,6 +170,29 @@ def test_link_parcel_shared_version(store: DocumentStore) -> None:
     assert [doc.id for doc in docs_2] == [version_id]
 
 
+def test_unlinked_versions_for_municipality(store: DocumentStore) -> None:
+    version_id = store.register_ref(_base_ref())
+    other = store.register_ref(
+        _base_ref(municipality="Городской округ Клин", source_object_id="klin-1")
+    )
+    cn_b = "50:09:0000000:200001"
+
+    store.link_parcel(CN_1, version_id)
+    # для CN_1 версия уже привязана — не возвращается
+    assert store.unlinked_versions_for_municipality(MUNICIPALITY, CN_1) == []
+    # для к/н B версия муниципалитета ещё не привязана — возвращается
+    unlinked = store.unlinked_versions_for_municipality(MUNICIPALITY, cn_b)
+    assert [v.id for v in unlinked] == [version_id]
+    # чужой муниципалитет не подмешивается
+    klin_unlinked = store.unlinked_versions_for_municipality("Городской округ Клин", cn_b)
+    assert [v.id for v in klin_unlinked] == [other]
+    klin_for_cn1 = store.unlinked_versions_for_municipality("Городской округ Клин", CN_1)
+    assert [v.id for v in klin_for_cn1] == [other]
+    # привязка B закрывает версию и для него
+    store.link_parcel(cn_b, version_id)
+    assert store.unlinked_versions_for_municipality(MUNICIPALITY, cn_b) == []
+
+
 def test_find_version_roundtrip(store: DocumentStore) -> None:
     assert (
         store.find_version(

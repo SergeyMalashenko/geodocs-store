@@ -23,6 +23,14 @@ ORDER BY v.id
 """
 
 
+def task_slug(doc_type: str, number: str) -> str:
+    """Каталог задачи: «{doc_type}-{number}» с «/», «-», «_» → «_», lower."""
+    slug = f"{doc_type}-{number}"
+    for char in ("/", "-", "_"):
+        slug = slug.replace(char, "_")
+    return slug.lower()
+
+
 class AgentTask(BaseModel):
     """Задача для внешнего агента: конкретная редакция без валидного файла."""
 
@@ -38,10 +46,7 @@ class AgentTask(BaseModel):
     @property
     def slug(self) -> str:
         """Каталог задачи: «{doc_type}-{number}» с «/», «-», «_» → «_», lower."""
-        slug = f"{self.doc_type}-{self.number}"
-        for char in ("/", "-", "_"):
-            slug = slug.replace(char, "_")
-        return slug.lower()
+        return task_slug(self.doc_type, self.number)
 
 
 def list_pending_tasks(

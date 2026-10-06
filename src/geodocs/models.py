@@ -38,6 +38,8 @@ class SourceName(str, Enum):
     CNTD = "cntd"
     MUNICIPAL = "municipal"
     KIMI_AGENT = "kimi-agent"
+    HERMES_AGENT = "hermes-agent"
+    MANUAL = "manual"
 
 
 class FetchStatus(str, Enum):
