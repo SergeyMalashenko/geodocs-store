@@ -69,7 +69,11 @@ class ExtractionOrigin(str, Enum):
 
 
 class DocumentRef(BaseModel):
-    """Ссылка на документ, пришедшая из discovery-провайдера."""
+    """Ссылка на документ, пришедшая из discovery-провайдера.
+
+    `version_id` — handle локальной базы: заполняется, когда ref уже
+    зарегистрирован в хранилище (acquire_documents → query_documents).
+    """
 
     municipality: str
     doc_type: DocType
@@ -82,6 +86,7 @@ class DocumentRef(BaseModel):
     source: SourceName
     source_object_id: str | None = None
     amendment_number: str | None = None
+    version_id: int | None = None
 
 
 class DocumentRecord(BaseModel):

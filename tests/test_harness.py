@@ -808,10 +808,8 @@ def _task() -> AgentTask:
 def test_prompt_orders_tools_before_web_search() -> None:
     prompt = build_prompt(_task(), "/tmp/inbox/pzz_1069")
     order = [
-        prompt.index("check_local_store"),
-        prompt.index("search_document"),
-        prompt.index("download_document"),
-        prompt.index("fetch_page"),
+        prompt.index("find_document"),
+        prompt.index("import_document"),
         prompt.index("ВЕБ-ПОИСК"),
     ]
     assert order == sorted(order), "инструменты должны идти раньше веб-поиска"

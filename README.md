@@ -27,6 +27,51 @@ uv run pytest -q
 uv run ruff check src tests
 ```
 
+## Публичный API второго контура
+
+Два метода скрывают от первого контура (terralogic-engine, pyrgis/pynspd)
+всю механику поиска, скачивания, кэширования, чтения и извлечения:
+
+```python
+from geodocs import acquire_documents, query_documents
+
+# 1) обеспечить наличие документа в локальном хранилище (cache-first)
+acquired = acquire_documents(
+    "Городской округ Коломна", "pzz", number="1198", version_date="2026-04-17",
+)
+# status: cached (уже в базе, агент не запускался) | acquired | not_found | failed
+version_id = acquired.refs[0].version_id
+
+# 2) семантический запрос к известным документам
+result = query_documents(
+    documents=[version_id],           # int = version_id; также DocumentRef
+    query="Верни ВРИ территориальной зоны СХ-2",
+    response_schema={                  # опционально: JSON Schema словарём
+        "type": "object",
+        "properties": {
+            "zone_code": {"type": "string"},
+            "permitted_uses": {"type": "array", "items": {"type": "object"}},
+        },
+        "required": ["zone_code", "permitted_uses"],
+    },
+)
+# result.status: success | partial | not_found | ambiguous
+#              | insufficient_evidence | failed
+# result.data — валидирован по response_schema; result.evidence — цитаты
+# (version_id, file, page, section, quote) для каждого факта.
+```
+
+Инварианты, зашитые в код (не зависят от решения LLM): cache-first в
+`acquire_documents`; в `query_documents` — протокол `=== RESULT === {json}`
+с одним retry при невалидном JSON/схеме, правило «extract, don't infer»
+(каждое поле `data` подтверждено цитатой в `evidence`) и механическое
+понижение success/partial без цитат до `insufficient_evidence`.
+
+Первый контур не знает: где лежит файл, PDF это или DOCX, какой parser
+используется, есть ли готовые extractions, какая LLM и какие tools
+вызываются внутри. `ask_document` (см. ниже) остаётся тонким сахаром для
+discovery-Q&A без перечня документов.
+
 ## Агентный ярус
 
 Документы, которые статика не добрала (`not_found`, `pending`), добывают
@@ -115,22 +160,19 @@ extra: `pip install 'geodocs[mcp]'`); `auth.json`/`.env` — симлинки н
 инструменты порталов → скачивание → свободный веб-поиск штатными
 веб-инструментами Hermes (Firecrawl, последнее звено) → MANIFEST.
 
-Инструменты MCP (параллельный поиск, ошибка одного портала не роняет
-остальные):
+Агенту видны ровно три инструмента — вся механика зашита внутри них, модель
+принимает только семантические решения:
 
 | Инструмент | Что делает |
 |---|---|
-| `check_local_store` | Статус версии в SQLite-базе: не искать то, что есть |
-| `search_document` | Поиск по всем порталам реестра, merged-кандидаты с тегами |
-| `download_document` | Скачивание в inbox задачи; HTML отклоняется |
-| `fetch_page` | HTML→текст + ссылки на файлы (муниципальные сайты без API) |
-| `find_documents` | Read-only: версии в базе по подстроке (номер/название/муниципалитет) |
-| `document_files` | Read-only: файлы версии |
-| `read_document_text` | Read-only: текст файла версии (PDF/DOCX/HTML), порциями |
-| `document_extractions` | Read-only: готовые структурированные фрагменты (таблицы ВРИ) |
+| `find_document` | Cache-first discovery: локальная база (версия `downloaded` сразу готова к чтению), при промахе — поиск по всем порталам реестра, merged-кандидаты с тегами |
+| `import_document` | Внешний URL (файл или HTML-страница со ссылками) → локальный документ: скачивание, гейт, регистрация в базе, возврат `version_id` |
+| `read_document` | Чтение локального документа: карточка, файлы, готовые extractions (приоритет) и релевантные фрагменты текста с номерами страниц |
 
-Read-only группа обслуживает Q&A поверх локальной базы — единый метод
-извлечения сведений из документов (см. ниже).
+Низкоуровневые блоки (`search_document`, `download_document`, `fetch_page`,
+`read_document_text` и др.) остаются в `geodocs.agent.mcp` как внутренние
+строительные кирпичи и точки тестирования — в MCP-сервере они не
+регистрируются.
 
 ### Q&A по локальной базе: `ask_document`
 
@@ -149,8 +191,8 @@ result = ask_document("Верни ВРИ для документа № 1198 Ко
 print(result.answer)   # ответ + источник (муниципалитет, №, дата, файл)
 ```
 
-Агент сначала проверяет `document_extractions` (дешёвые статические экстракторы
-уже могли извлечь таблицу ВРИ), затем читает полный текст файлов.
+Агент работает инструментами `find_document` (выбор версии по реквизитам)
+и `read_document` (готовые extractions раньше полного текста).
 
 Порталы-доноры (`src/geodocs/agent/portals/`, регистрация —
 `register_portal`): **meganorm** (нормо-база; fetch отказывается сохранять
