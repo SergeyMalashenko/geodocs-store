@@ -2,7 +2,7 @@
 
 LLM-агент не запускается: для ask_document используется исполнитель
 тестового типа "stub" (реестр, как в test_executors), read-only инструменты
-(find_documents/document_files/read_document_text/get_extractions)
+(find_documents/document_files/read_document_text/document_extractions)
 вызываются напрямую, без транспорта MCP.
 """
 
@@ -35,9 +35,9 @@ from geodocs.agent import (
 )
 from geodocs.agent.mcp import (
     McpContext,
+    document_extractions_impl,
     document_files_impl,
     find_documents_impl,
-    get_extractions_impl,
     read_document_text_impl,
 )
 
@@ -242,8 +242,8 @@ def test_read_document_text_impl_index_out_of_range(home: Path, seeded: int) -> 
     assert "error" in result
 
 
-def test_get_extractions_impl_returns_payload(home: Path, seeded: int) -> None:
-    result = get_extractions_impl(_ctx(home), seeded)
+def test_document_extractions_impl_returns_payload(home: Path, seeded: int) -> None:
+    result = document_extractions_impl(_ctx(home), seeded)
     (extraction,) = result["extractions"]
     assert extraction["zone_code"] == "Ж-1"
     assert extraction["kind"] == "vri_table"

@@ -4,7 +4,7 @@
 веб-поиска: поиск по порталам-донорам, скачивание файлов в inbox, чтение
 HTML-страниц и проверку локальной базы. Отдельная группа read-only
 инструментов (find_documents, document_files, read_document_text,
-get_extractions) обслуживает Q&A поверх локальной базы — см. agent/ask.py.
+document_extractions) обслуживает Q&A поверх локальной базы — см. agent/ask.py.
 Запуск — stdio:
 
     GEODOCS_AGENT_INBOX=<inbox> GEODOCS_HOME=<home> geodocs-agent-mcp
@@ -342,7 +342,7 @@ def read_document_text_impl(
     }
 
 
-def get_extractions_impl(ctx: McpContext, version_id: int) -> dict[str, Any]:
+def document_extractions_impl(ctx: McpContext, version_id: int) -> dict[str, Any]:
     """Уже извлечённые структурированные фрагменты версии (таблицы ВРИ и др.)."""
     store = _open_store(ctx)
     try:
@@ -434,7 +434,7 @@ def build_server(ctx: McpContext) -> Any:
         description=(
             "Поиск документов в ЛОКАЛЬНОЙ базе geodocs по подстроке: номер,"
             " название или муниципалитет. Возвращает version_id для"
-            " read_document_text/get_extractions."
+            " read_document_text/document_extractions."
         ),
     )
     async def find_documents(
@@ -462,14 +462,14 @@ def build_server(ctx: McpContext) -> Any:
         return read_document_text_impl(ctx, version_id, file_index, max_chars)
 
     @server.tool(
-        name="get_extractions",
+        name="document_extractions",
         description=(
             "Готовые структурированные фрагменты версии (таблицы ВРИ и др.),"
             " извлечённые ранее. Проверяй ПЕРЕД чтением полного текста."
         ),
     )
-    async def get_extractions(version_id: int) -> dict[str, Any]:
-        return get_extractions_impl(ctx, version_id)
+    async def document_extractions(version_id: int) -> dict[str, Any]:
+        return document_extractions_impl(ctx, version_id)
 
     return server
 
