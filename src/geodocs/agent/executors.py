@@ -1,9 +1,20 @@
-"""Исполнители агентного яруса: сменные адаптеры над CLI-агентами (kimi, hermes).
+"""Исполнители агентного яруса: сменные адаптеры над CLI-агентами.
 
-Каждый исполнитель — тонкая обёртка над one-shot subprocess (без shell):
-`command + args + <промт>` в каталоге задачи с захватом stdout/stderr.
-Исчерпание LLM-квоты (паттерны из конфига) поднимает QuotaExceeded —
-это сигнал failover-цепочке переключиться на следующего исполнителя.
+Каждый исполнитель — тонкая обёртка над one-shot запуском LLM-агента по
+промту с захватом stdout/stderr. Исчерпание квоты (паттерны из конфига)
+поднимает QuotaExceeded — сигнал failover-цепочке переключиться на
+следующего исполнителя.
+
+Новый агент добавляется без правок этого модуля:
+
+    class MyAgentExecutor(SubprocessExecutor):
+        provider = SourceName.MANUAL  # или свой SourceName
+        # при необходимости — своя логика run()
+
+    register_executor_type("myagent", MyAgentExecutor)
+
+После регистрации тип доступен в agents.yaml (`type: myagent`), а цепочка,
+failover, retry и квоты работают без изменений.
 """
 
 from __future__ import annotations
@@ -11,12 +22,13 @@ from __future__ import annotations
 import shlex
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from ..models import SourceName
-from .config import ExecutorConfig
+from .config import AgentConfigError, ExecutorConfig
 
 _TAIL_LEN = 400
 
@@ -137,20 +149,33 @@ class KimiExecutor(SubprocessExecutor):
     provider = SourceName.KIMI_AGENT
 
 
-class HermesExecutor(SubprocessExecutor):
-    """Hermes CLI one-shot: `hermes -z "<prompt>`."""
+_EXECUTOR_TYPES: dict[str, Callable[[ExecutorConfig], Executor]] = {}
 
-    provider = SourceName.HERMES_AGENT
+
+def register_executor_type(
+    type_name: str, factory: Callable[[ExecutorConfig], Executor]
+) -> None:
+    """Регистрирует адаптер исполнителя; перезапись зарегистрированного имени — ValueError."""
+    if type_name in _EXECUTOR_TYPES:
+        raise ValueError(f"тип исполнителя {type_name!r} уже зарегистрирован")
+    _EXECUTOR_TYPES[type_name] = factory
+
+
+def executor_type_names() -> tuple[str, ...]:
+    """Имена зарегистрированных типов (валидация конфига, сообщения об ошибках)."""
+    return tuple(_EXECUTOR_TYPES)
 
 
 def build_executor(cfg: ExecutorConfig) -> Executor:
     """Фабрика адаптера по записи конфига; неизвестный type — ошибка конфига."""
-    if cfg.type == "kimi":
-        return KimiExecutor(cfg)
-    if cfg.type == "hermes":
-        return HermesExecutor(cfg)
-    from .config import AgentConfigError
+    factory = _EXECUTOR_TYPES.get(cfg.type)
+    if factory is None:
+        known = ", ".join(executor_type_names()) or "нет зарегистрированных"
+        raise AgentConfigError(
+            f"исполнитель {cfg.name!r}: неизвестный type {cfg.type!r}"
+            f" (зарегистрированные: {known})"
+        )
+    return factory(cfg)
 
-    raise AgentConfigError(
-        f"исполнитель {cfg.name!r}: неизвестный type {cfg.type!r} (известные: kimi, hermes)"
-    )
+
+register_executor_type("kimi", KimiExecutor)

@@ -105,7 +105,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="geodocs-agent",
         description=(
-            "Агентный ярус документного поиска: внешние агенты (kimi, hermes)"
+            "Агентный ярус документного поиска: внешние агенты"
             " добирают документы, которые статический поиск не нашёл."
         ),
     )
@@ -132,7 +132,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--chain",
         default=None,
-        help="порядок failover поверх конфига, напр. kimi,hermes",
+        help="порядок failover поверх конфига: имена исполнителей из agents.yaml",
     )
     run_parser.add_argument(
         "--workers",

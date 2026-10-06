@@ -523,8 +523,8 @@ class DocumentStore:
         Первичным файлом редакции становится первый PDF с «изменен»/«решение»
         в имени, иначе первый PDF, иначе первый файл. Набор `version_files`
         версии заменяется целиком, provenance дополняется источником
-        `source_provider` (kimi-agent/hermes-agent — добыт исполнителем,
-        manual — принят из inbox вручную через recover). `source_url=None`
+        `source_provider` (kimi-agent — добыт исполнителем, manual — принят
+        из inbox вручную через recover). `source_url=None`
         означает, что URL неизвестен: прежний source_url версии сохраняется,
         запись provenance не добавляется (source_object_id обязателен в схеме).
         Повторный вызов с теми же файлами идемпотентен.

@@ -12,10 +12,10 @@ from .executors import (
     ExecutionTimeout,
     Executor,
     ExecutorError,
-    HermesExecutor,
     KimiExecutor,
     QuotaExceeded,
     build_executor,
+    register_executor_type,
 )
 from .gate import FileVerdict, gate_pass, verify_files
 from .prompt import PROMPT_TEMPLATE, build_prompt, doc_type_ru
@@ -43,7 +43,6 @@ __all__ = [
     "ExecutorConfig",
     "ExecutorError",
     "FileVerdict",
-    "HermesExecutor",
     "KimiExecutor",
     "QuotaExceeded",
     "TaskResult",
@@ -57,6 +56,7 @@ __all__ = [
     "load_config",
     "parse_manifest",
     "recover_inbox",
+    "register_executor_type",
     "run_agent_tier",
     "run_pending",
     "run_task",

@@ -1,8 +1,11 @@
 """Конфиг-реестр исполнителей агентного яруса: $GEODOCS_HOME/agents.yaml.
 
-Файл опционален: без него используются встроенные дефолты (chain kimi→hermes).
+Файл опционален: без него используются встроенные дефолты (chain из kimi).
 Путь к файлу переопределяется env `GEODOCS_AGENTS_CONFIG`. Процессы
 короткоживущие, поэтому конфиг перечитывается при каждом запуске CLI.
+Дополнительные типы исполнителей регистрируются кодом
+(`geodocs.agent.executors.register_executor_type`) и доступны в agents.yaml
+сразу после регистрации.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "retry_attempts": 2,
         "retry_pause_seconds": 60,
     },
-    "chain": ["kimi", "hermes"],
+    "chain": ["kimi"],
     "executors": {
         "kimi": {
             "type": "kimi",
@@ -41,17 +44,8 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
             "timeout_seconds": 900,
             "quota_patterns": list(_DEFAULT_QUOTA_PATTERNS),
         },
-        "hermes": {
-            "type": "hermes",
-            "command": "hermes",
-            "args": ["-z"],
-            "timeout_seconds": 900,
-            "quota_patterns": list(_DEFAULT_QUOTA_PATTERNS),
-        },
     },
 }
-
-_KNOWN_TYPES = ("kimi", "hermes")
 
 
 class AgentConfigError(ValueError):
@@ -145,6 +139,9 @@ def _as_int(value: Any, *, field_name: str, source: str, minimum: int = 0) -> in
 
 
 def _parse_config(raw: dict[str, Any], *, source: str) -> AgentTierConfig:
+    # ленивый импорт: executors импортирует этот модуль на верхнем уровне
+    from .executors import executor_type_names
+
     defaults = raw.get("defaults") or {}
     if not isinstance(defaults, dict):
         raise AgentConfigError(f"{source}: секция 'defaults' должна быть mapping")
@@ -188,10 +185,12 @@ def _parse_config(raw: dict[str, Any], *, source: str) -> AgentTierConfig:
             raise AgentConfigError(
                 f"{source}: {label}: поле 'type' должно быть строкой"
             )
-        if entry_type not in _KNOWN_TYPES:
-            known = ", ".join(_KNOWN_TYPES)
+        known_types = executor_type_names()
+        if entry_type not in known_types:
+            known = ", ".join(known_types) or "нет зарегистрированных"
             raise AgentConfigError(
-                f"{source}: {label}: неизвестный type {entry_type!r} (известные: {known})"
+                f"{source}: {label}: неизвестный type {entry_type!r}"
+                f" (зарегистрированные: {known})"
             )
         command = entry.get("command", entry_type)
         if not isinstance(command, str) or not command:

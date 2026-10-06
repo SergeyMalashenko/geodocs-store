@@ -1,7 +1,7 @@
 """Тесты мульти-агентного яруса: конфиг-реестр, адаптеры, failover-цепочка.
 
-Внешние CLI (kimi/hermes) не запускаются: subprocess мокается, на уровне
-раннера используются фиктивные исполнители с тем же протоколом Executor.
+Внешние CLI не запускаются: subprocess мокается, на уровне раннера
+используются исполнители зарегистрированного тестового типа "stub".
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import subprocess
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -43,7 +43,6 @@ from geodocs.agent import (
     run_task,
 )
 from geodocs.agent.cli import main
-from geodocs.agent.executors import SubprocessExecutor
 from geodocs.agent.stats import collect_stats, render_stats, stats_to_dict
 
 MUNICIPALITY = "Городской округ Солнечногорск"
@@ -146,66 +145,101 @@ def _fetch_as_agent(
 
 
 # ---------------------------------------------------------------------------
-# Фиктивные исполнители
+# Фиктивные исполнители: тестовый тип "stub", зарегистрированный через реестр
 # ---------------------------------------------------------------------------
 
+_STUB_BEHAVIORS: dict[str, Callable[[str, Path], ExecutionResult]] = {}
+_STUB_PROVIDERS: dict[str, SourceName] = {}
 
-class FakeExecutor:
-    """Исполнитель-заглушка: script(prompt, workdir) -> ExecutionResult или error."""
 
-    def __init__(
-        self,
-        name: str,
-        provider: SourceName,
-        script: Callable[[str, Path], ExecutionResult] | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        self.name = name
-        self.provider = provider
+class StubExecutor:
+    """Исполнитель тестового типа "stub": поведение подконтрольно тесту."""
+
+    def __init__(self, cfg: ExecutorConfig) -> None:
+        self.name = cfg.name
+        self.provider = _STUB_PROVIDERS.get(cfg.name, SourceName.MANUAL)
         self.calls = 0
-        self.prompts: list[str] = []
-        self._script = script
-        self._error = error
 
     def run(self, prompt: str, workdir: Path) -> ExecutionResult:
         self.calls += 1
-        self.prompts.append(prompt)
-        if self._error is not None:
-            raise self._error
-        assert self._script is not None
-        return self._script(prompt, workdir)
+        behavior = _STUB_BEHAVIORS.get(self.name)
+        if behavior is None:
+            raise AssertionError(f"нет поведения для stub-исполнителя {self.name!r}")
+        return behavior(prompt, workdir)
 
 
-def _downloader(
+@pytest.fixture()
+def stub_type() -> Iterator[None]:
+    """Регистрирует тип "stub" и восстанавливает реестр после теста."""
+    from geodocs.agent import executors as executors_module
+
+    snapshot = dict(executors_module._EXECUTOR_TYPES)
+    if "stub" not in executors_module._EXECUTOR_TYPES:
+        executors_module.register_executor_type("stub", StubExecutor)
+    _STUB_BEHAVIORS.clear()
+    _STUB_PROVIDERS.clear()
+    yield
+    executors_module._EXECUTOR_TYPES.clear()
+    executors_module._EXECUTOR_TYPES.update(snapshot)
+    _STUB_BEHAVIORS.clear()
+    _STUB_PROVIDERS.clear()
+
+
+def _stub(
     name: str,
     provider: SourceName,
-    *,
-    source_url: str = "https://solreg.ru/docs/944",
-) -> FakeExecutor:
-    """Исполнитель, который «скачивает» валидный PDF в inbox из промта и печатает MANIFEST."""
+    behavior: Callable[[str, Path], ExecutionResult],
+) -> StubExecutor:
+    """Строит исполнитель зарегистрированного тестового типа "stub"."""
+    _STUB_PROVIDERS[name] = provider
+    _STUB_BEHAVIORS[name] = behavior
+    return cast(
+        StubExecutor,
+        build_executor(
+            ExecutorConfig(
+                name=name,
+                type="stub",
+                command="stub",
+                args=[],
+                timeout_seconds=60,
+                quota_patterns=[],
+            )
+        ),
+    )
 
-    def script(prompt: str, workdir: Path) -> ExecutionResult:
-        match = _INBOX_RE.search(prompt)
-        assert match is not None
-        inbox = Path(match.group(1))
-        inbox.mkdir(parents=True, exist_ok=True)
-        (inbox / "2026-04-09_решение.pdf").write_bytes(_pdf_bytes())
-        manifest = {
-            "status": "found",
-            "files": ["2026-04-09_решение.pdf"],
-            "source_url": source_url,
-        }
-        return ExecutionResult(
-            stdout="шаг 1\n"
-            + MANIFEST_MARKER
-            + " "
-            + json.dumps(manifest, ensure_ascii=False),
-            stderr="",
-            returncode=0,
-            duration_seconds=0.1,
-        )
 
-    return FakeExecutor(name, provider, script=script)
+def _download_behavior(prompt: str, workdir: Path) -> ExecutionResult:
+    """«Скачивает» валидный PDF в inbox из промта и печатает MANIFEST."""
+    match = _INBOX_RE.search(prompt)
+    assert match is not None
+    inbox = Path(match.group(1))
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "2026-04-09_решение.pdf").write_bytes(_pdf_bytes())
+    manifest = {
+        "status": "found",
+        "files": ["2026-04-09_решение.pdf"],
+        "source_url": "https://solreg.ru/docs/944",
+    }
+    return ExecutionResult(
+        stdout="шаг 1\n"
+        + MANIFEST_MARKER
+        + " "
+        + json.dumps(manifest, ensure_ascii=False),
+        stderr="",
+        returncode=0,
+        duration_seconds=0.1,
+    )
+
+
+def _failing_behavior(error: Exception) -> Callable[[str, Path], ExecutionResult]:
+    def behavior(prompt: str, workdir: Path) -> ExecutionResult:
+        raise error
+
+    return behavior
+
+
+def _downloader(name: str, provider: SourceName) -> StubExecutor:
+    return _stub(name, provider, _download_behavior)
 
 
 def _single_pass(chain: list[str], **overrides: Any) -> AgentTierConfig:
@@ -231,7 +265,8 @@ def test_default_config_without_file(
     from geodocs.agent import load_config
 
     cfg = load_config(home)  # файла agents.yaml нет
-    assert cfg.chain == ["kimi", "hermes"]
+    assert cfg.chain == ["kimi"]
+    assert list(cfg.executors) == ["kimi"]
     assert cfg.workers == 1
     assert cfg.retry_attempts == 2
     assert cfg.retry_pause_seconds == 60
@@ -243,12 +278,12 @@ def test_default_config_without_file(
         ["-p"],
         900,
     )
-    hermes = cfg.executors["hermes"]
-    assert (hermes.type, hermes.command, hermes.args) == ("hermes", "hermes", ["-z"])
     assert any("额度" in pattern for pattern in kimi.quota_patterns)
 
 
-def test_load_agents_yaml(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_agents_yaml(
+    home: Path, monkeypatch: pytest.MonkeyPatch, stub_type: Iterator[None]
+) -> None:
     from geodocs.agent import load_config
 
     (home / "agents.yaml").write_text(
@@ -260,7 +295,7 @@ def test_load_agents_yaml(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                     "retry_pause_seconds": 5,
                 },
                 "run_after_sync": True,
-                "chain": ["hermes", "kimi"],
+                "chain": ["reserve", "kimi"],
                 "executors": {
                     "kimi": {
                         "type": "kimi",
@@ -269,10 +304,8 @@ def test_load_agents_yaml(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                         "timeout_seconds": 30,
                         "quota_patterns": ["(?i)quota"],
                     },
-                    "hermes": {
-                        "type": "hermes",
-                        "command": "hermes",
-                        "args": ["-z"],
+                    "reserve": {
+                        "type": "stub",
                         "timeout_seconds": 60,
                         "quota_patterns": ["429"],
                     },
@@ -287,27 +320,36 @@ def test_load_agents_yaml(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.retry_attempts == 4
     assert cfg.retry_pause_seconds == 5
     assert cfg.run_after_sync is True
-    assert cfg.chain == ["hermes", "kimi"]
+    assert cfg.chain == ["reserve", "kimi"]
     assert cfg.executors["kimi"].command == "/opt/kimi"
     assert cfg.executors["kimi"].timeout_seconds == 30
-    assert cfg.executors["hermes"].quota_patterns == ["429"]
+    reserve = cfg.executors["reserve"]
+    assert (reserve.type, reserve.command, reserve.timeout_seconds) == (
+        "stub",
+        "stub",
+        60,
+    )
+    assert reserve.quota_patterns == ["429"]
 
 
 def test_config_env_override(
-    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stub_type: Iterator[None],
 ) -> None:
     from geodocs.agent import load_config
 
     override = tmp_path / "elsewhere.yaml"
     override.write_text(
-        yaml.dump({"chain": ["hermes"], "executors": {"hermes": {"type": "hermes"}}}),
+        yaml.dump({"chain": ["solo"], "executors": {"solo": {"type": "stub"}}}),
         encoding="utf-8",
     )
     (home / "agents.yaml").write_text("chain: [kimi]\n", encoding="utf-8")
     monkeypatch.setenv("GEODOCS_AGENTS_CONFIG", str(override))
     cfg = load_config(home)
-    assert cfg.chain == ["hermes"]
-    assert list(cfg.executors) == ["hermes"]
+    assert cfg.chain == ["solo"]
+    assert list(cfg.executors) == ["solo"]
 
 
 def test_config_broken_yaml_reports_path(
@@ -352,6 +394,24 @@ def test_config_chain_hole(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GEODOCS_AGENTS_CONFIG", raising=False)
     with pytest.raises(AgentConfigError, match="ghost"):
         load_config(home)
+
+
+def test_register_executor_type_rejects_duplicates(
+    stub_type: Iterator[None],
+) -> None:
+    from geodocs.agent.executors import register_executor_type
+
+    with pytest.raises(ValueError, match="уже зарегистрирован"):
+        register_executor_type("stub", StubExecutor)
+    with pytest.raises(ValueError, match="уже зарегистрирован"):
+        register_executor_type("kimi", StubExecutor)
+
+
+def test_executor_registry_restored_between_tests() -> None:
+    """stub-тип тестовой фикстуры не должен протекать в соседние тесты."""
+    from geodocs.agent.executors import executor_type_names
+
+    assert "stub" not in executor_type_names()
 
 
 # ---------------------------------------------------------------------------
@@ -474,9 +534,9 @@ def test_build_executor_unknown_type() -> None:
 
 def test_subprocess_executor_provider_mapping() -> None:
     assert KimiExecutor(_kimi_cfg()).provider is SourceName.KIMI_AGENT
-    hermes = build_executor(_kimi_cfg(name="hermes", type="hermes", args=["-z"]))
-    assert hermes.provider is SourceName.HERMES_AGENT
-    assert isinstance(hermes, SubprocessExecutor)
+    built = build_executor(_kimi_cfg())
+    assert isinstance(built, KimiExecutor)
+    assert built.provider is SourceName.KIMI_AGENT
 
 
 # ---------------------------------------------------------------------------
@@ -485,23 +545,28 @@ def test_subprocess_executor_provider_mapping() -> None:
 
 
 def test_failover_order_and_source_provider(
-    store: DocumentStore, seeded: dict[str, int], home: Path
+    store: DocumentStore,
+    seeded: dict[str, int],
+    home: Path,
+    stub_type: Iterator[None],
 ) -> None:
     task = list_pending_tasks(store, statuses=("not_found",))[0]
-    kimi = FakeExecutor(
-        "kimi", SourceName.KIMI_AGENT, error=QuotaExceeded("kimi", "429")
+    kimi = _stub(
+        "kimi",
+        SourceName.KIMI_AGENT,
+        _failing_behavior(QuotaExceeded("kimi", "429")),
     )
-    hermes = _downloader("hermes", SourceName.HERMES_AGENT)
-    config = _single_pass(["kimi", "hermes"])
+    backup = _downloader("backup", SourceName.KIMI_AGENT)
+    config = _single_pass(["kimi", "backup"])
 
     result = run_task(
-        task, store, executors=[kimi, hermes], config=config, geodocs_home=home
+        task, store, executors=[kimi, backup], config=config, geodocs_home=home
     )
 
     assert result.status == "downloaded"
-    assert result.executor == "hermes"
+    assert result.executor == "backup"
     assert result.quota_exhausted == ["kimi"]
-    assert kimi.calls == 1 and hermes.calls == 1
+    assert kimi.calls == 1 and backup.calls == 1
     version = store.find_version(
         municipality=MUNICIPALITY,
         doc_type=DocType.PZZ,
@@ -509,32 +574,37 @@ def test_failover_order_and_source_provider(
         version_date=AMENDMENT_DATE,
     )
     assert version is not None
-    assert version.source_provider is SourceName.HERMES_AGENT
-    assert ("hermes-agent", "https://solreg.ru/docs/944") in (
+    assert version.source_provider is SourceName.KIMI_AGENT
+    assert ("kimi-agent", "https://solreg.ru/docs/944") in (
         store.source_refs_for_version(task.version_id)
     )
 
 
 def test_quota_exhausted_skipped_for_rest_of_run(
-    store: DocumentStore, seeded: dict[str, int], home: Path
+    store: DocumentStore,
+    seeded: dict[str, int],
+    home: Path,
+    stub_type: Iterator[None],
 ) -> None:
-    """Kimi упёрся в квоту на первой задаче — для второй его уже не звать."""
-    kimi = FakeExecutor(
-        "kimi", SourceName.KIMI_AGENT, error=QuotaExceeded("kimi", "(?i)quota")
+    """Первый исполнитель упёрся в квоту на первой задаче — дальше его не звать."""
+    kimi = _stub(
+        "kimi",
+        SourceName.KIMI_AGENT,
+        _failing_behavior(QuotaExceeded("kimi", "(?i)quota")),
     )
-    hermes = _downloader("hermes", SourceName.HERMES_AGENT)
-    config = _single_pass(["kimi", "hermes"])
+    backup = _downloader("backup", SourceName.KIMI_AGENT)
+    config = _single_pass(["kimi", "backup"])
 
     results = run_pending(
         store,
-        executors={"kimi": kimi, "hermes": hermes},
+        executors={"kimi": kimi, "backup": backup},
         config=config,
         geodocs_home=home,
     )
 
     assert [r.status for r in results] == ["downloaded", "downloaded"]
     assert kimi.calls == 1  # не 2: после квоты исключён из run
-    assert hermes.calls == 2
+    assert backup.calls == 2
     # квота задачи 1 зафиксирована в её результате; задача 2 шла без квотных событий
     assert results[0].quota_exhausted == ["kimi"]
     assert results[1].quota_exhausted == []
@@ -545,6 +615,7 @@ def test_retry_attempts_with_pause(
     seeded: dict[str, int],
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
+    stub_type: Iterator[None],
 ) -> None:
     """Первый проход падает, второй (после паузы) качает."""
     sleeps: list[float] = []
@@ -555,9 +626,9 @@ def test_retry_attempts_with_pause(
         error = next(attempts)
         if error is not None:
             raise error
-        return _downloader("kimi", SourceName.KIMI_AGENT)._script(prompt, workdir)  # type: ignore[misc]
+        return _download_behavior(prompt, workdir)
 
-    kimi = FakeExecutor("kimi", SourceName.KIMI_AGENT, script=flaky)
+    kimi = _stub("kimi", SourceName.KIMI_AGENT, flaky)
     task = list_pending_tasks(store, statuses=("not_found",))[0]
     config = _single_pass(["kimi"], retry_attempts=2, retry_pause_seconds=7)
 
@@ -570,29 +641,36 @@ def test_retry_attempts_with_pause(
 
 
 def test_final_escalation_to_manual_required(
-    store: DocumentStore, seeded: dict[str, int], home: Path
+    store: DocumentStore,
+    seeded: dict[str, int],
+    home: Path,
+    stub_type: Iterator[None],
 ) -> None:
     """Все проходы неудачны → manual_required в result-JSON; recover показывает задачу."""
     from geodocs.agent.cli import recover_pending
 
-    kimi = FakeExecutor(
-        "kimi", SourceName.KIMI_AGENT, error=ExecutorError("бинарь сломан")
+    kimi = _stub(
+        "kimi",
+        SourceName.KIMI_AGENT,
+        _failing_behavior(ExecutorError("бинарь сломан")),
     )
-    hermes = FakeExecutor(
-        "hermes", SourceName.HERMES_AGENT, error=QuotaExceeded("hermes", "429")
+    backup = _stub(
+        "backup",
+        SourceName.MANUAL,
+        _failing_behavior(QuotaExceeded("backup", "429")),
     )
     task = list_pending_tasks(store, statuses=("not_found",))[0]
-    config = _single_pass(["kimi", "hermes"], retry_attempts=2)
+    config = _single_pass(["kimi", "backup"], retry_attempts=2)
 
     result = run_task(
-        task, store, executors=[kimi, hermes], config=config, geodocs_home=home
+        task, store, executors=[kimi, backup], config=config, geodocs_home=home
     )
 
     assert result.status == "manual_required"
     assert result.error and "бинарь сломан" in result.error
-    assert result.quota_exhausted == ["hermes"]
+    assert result.quota_exhausted == ["backup"]
     assert kimi.calls == 2  # каждый проход: ошибка запуска — не квота
-    assert hermes.calls == 1  # после квоты в проходе 1 во второй его не звали
+    assert backup.calls == 1  # после квоты в проходе 1 во второй его не звали
     saved = json.loads(
         (home / "agent" / "results" / f"{task.slug}.json").read_text(encoding="utf-8")
     )
@@ -615,30 +693,38 @@ def test_all_quota_exhausted_short_circuits_retry(
     seeded: dict[str, int],
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
+    stub_type: Iterator[None],
 ) -> None:
     """Оба исполнителя в квоте → дальнейшие проходы бессмысленны, без пауз."""
     sleeps: list[float] = []
     monkeypatch.setattr("geodocs.agent.runner.time.sleep", sleeps.append)
-    kimi = FakeExecutor(
-        "kimi", SourceName.KIMI_AGENT, error=QuotaExceeded("kimi", "429")
+    kimi = _stub(
+        "kimi",
+        SourceName.KIMI_AGENT,
+        _failing_behavior(QuotaExceeded("kimi", "429")),
     )
-    hermes = FakeExecutor(
-        "hermes", SourceName.HERMES_AGENT, error=QuotaExceeded("hermes", "429")
+    backup = _stub(
+        "backup",
+        SourceName.MANUAL,
+        _failing_behavior(QuotaExceeded("backup", "429")),
     )
     task = list_pending_tasks(store, statuses=("not_found",))[0]
-    config = _single_pass(["kimi", "hermes"], retry_attempts=3)
+    config = _single_pass(["kimi", "backup"], retry_attempts=3)
 
     result = run_task(
-        task, store, executors=[kimi, hermes], config=config, geodocs_home=home
+        task, store, executors=[kimi, backup], config=config, geodocs_home=home
     )
 
     assert result.status == "manual_required"
-    assert kimi.calls == 1 and hermes.calls == 1  # второй проход не начался
+    assert kimi.calls == 1 and backup.calls == 1  # второй проход не начался
     assert sleeps == []
 
 
 def test_workers_parallel_run(
-    store: DocumentStore, seeded: dict[str, int], home: Path
+    store: DocumentStore,
+    seeded: dict[str, int],
+    home: Path,
+    stub_type: Iterator[None],
 ) -> None:
     """workers>1: обе задачи добиты, result-JSON на месте у каждой."""
     kimi = _downloader("kimi", SourceName.KIMI_AGENT)
@@ -678,7 +764,7 @@ def test_stats_collects_providers_tasks_and_quota(
                 "status": "downloaded",
                 "executor": "kimi",
                 "attempts": 1,
-                "quota_exhausted": ["hermes"],
+                "quota_exhausted": ["backup"],
             }
         ),
         encoding="utf-8",
@@ -695,10 +781,10 @@ def test_stats_collects_providers_tasks_and_quota(
     assert provider.versions == 1
     assert provider.files == 1
     assert stats.status_counts == {"downloaded": 1, "manual_required": 1}
-    assert stats.quota_counts == {"hermes": 1}
+    assert stats.quota_counts == {"backup": 1}
     assert stats.manual_required == ["pzz_592"]
     text = render_stats(stats)
-    assert "kimi-agent" in text and "manual_required" in text and "hermes=1" in text
+    assert "kimi-agent" in text and "manual_required" in text and "backup=1" in text
     as_json = stats_to_dict(stats)
     assert as_json["providers"][0]["versions"] == 1
     json.dumps(as_json)  # сериализуемо
@@ -739,7 +825,7 @@ def test_cli_run_dry_run(
     monkeypatch.setenv("GEODOCS_HOME", str(home))
     assert main(["run", "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "kimi → hermes" in out
+    assert "цепочка: kimi" in out
     assert "pzz_944" in out and "pzz_592" in out
     assert "2 проходов" in out
     # ничего не запустилось: result-JSON нет, задачи не тронуты
@@ -754,10 +840,22 @@ def test_cli_run_dry_run_chain_override(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    (home / "agents.yaml").write_text(
+        yaml.dump(
+            {
+                "chain": ["kimi", "reserve"],
+                "executors": {
+                    "kimi": {"type": "kimi"},
+                    "reserve": {"type": "kimi", "command": "kimi-reserve"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setenv("GEODOCS_HOME", str(home))
-    assert main(["run", "--dry-run", "--chain", "hermes"]) == 0
+    assert main(["run", "--dry-run", "--chain", "reserve"]) == 0
     out = capsys.readouterr().out
-    assert "hermes" in out and "kimi" not in out
+    assert "цепочка: reserve" in out
 
     assert main(["run", "--dry-run", "--chain", "ghost"]) == 2
     assert "ghost" in capsys.readouterr().err
@@ -829,17 +927,10 @@ def test_cli_run_end_to_end_via_agents_yaml(
         yaml.dump(
             {
                 "defaults": {"retry_attempts": 1, "retry_pause_seconds": 0},
-                "chain": ["kimi", "hermes"],
+                "chain": ["kimi"],
                 "executors": {
                     "kimi": {
                         "type": "kimi",
-                        "command": str(script),
-                        "args": [],
-                        "timeout_seconds": 60,
-                        "quota_patterns": [],
-                    },
-                    "hermes": {
-                        "type": "hermes",
                         "command": str(script),
                         "args": [],
                         "timeout_seconds": 60,
