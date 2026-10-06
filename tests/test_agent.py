@@ -359,6 +359,15 @@ def test_parse_manifest_broken_json() -> None:
     assert parse_manifest(MANIFEST_MARKER + "\n{тоже не json") is None
 
 
+def test_parse_manifest_indented_marker() -> None:
+    """Агенты печатают маркер с отступом (вложенность в маркдаун-список)."""
+    stdout = (
+        "рассуждение\n"
+        '  === MANIFEST === {"status": "not_found", "files": [], "notes": "нет"}\n'
+    )
+    assert parse_manifest(stdout) == {"status": "not_found", "files": [], "notes": "нет"}
+
+
 # ---------------------------------------------------------------------------
 # verify_files / gate_pass
 # ---------------------------------------------------------------------------

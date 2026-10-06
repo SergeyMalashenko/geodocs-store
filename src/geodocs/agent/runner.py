@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -102,11 +103,12 @@ def parse_manifest(stdout: str) -> dict[str, Any] | None:
     lines = stdout.splitlines()
     for index in range(len(lines) - 1, -1, -1):
         line = lines[index]
-        if not line.startswith(MANIFEST_MARKER):
+        stripped = line.lstrip()
+        if not stripped.startswith(MANIFEST_MARKER):
             continue
         candidates = (
-            line[len(MANIFEST_MARKER):].strip(),
-            "\n".join(lines[index + 1:]).strip(),
+            stripped[len(MANIFEST_MARKER) :].strip(),
+            "\n".join(lines[index + 1 :]).strip(),
         )
         for candidate in candidates:
             if not candidate:
@@ -316,8 +318,7 @@ def _attempt_with_executor(
                 else:
                     status = "gate_failed"
                     error = (
-                        _failed_reasons(verdicts)
-                        or "агент не заявил ни одного файла"
+                        _failed_reasons(verdicts) or "агент не заявил ни одного файла"
                     )
 
     return TaskResult(
@@ -335,7 +336,9 @@ def _attempt_with_executor(
 
 def _single_pass_config() -> AgentTierConfig:
     """Конфиг по умолчанию для run_task: один проход без пауз."""
-    return AgentTierConfig(chain=[], executors={}, retry_attempts=1, retry_pause_seconds=0)
+    return AgentTierConfig(
+        chain=[], executors={}, retry_attempts=1, retry_pause_seconds=0
+    )
 
 
 def _run_task_chained(
@@ -395,7 +398,9 @@ def _run_task_chained(
                 break  # дальше некому дожимать: пауза не имеет смысла
             time.sleep(config.retry_pause_seconds)
 
-    status: TaskStatus = "not_found" if not_found_names and not notes else "manual_required"
+    status: TaskStatus = (
+        "not_found" if not_found_names and not notes else "manual_required"
+    )
     if status == "not_found" and last_result is not None:
         # честный «не найдено»: возвращаем манифест последней попытки
         last_result.attempts = passes_done
@@ -499,11 +504,15 @@ def run_pending(
     """
     home = Path(geodocs_home) if geodocs_home is not None else store.db_path.parent
     cfg = config or load_config(home)
-    executor_map = (
-        {name: build_executor(entry) for name, entry in cfg.executors.items()}
-        if executors is None
-        else dict(executors)
-    )
+    if executors is None:
+        # home общей базы проводим в конфиг исполнителя: MCP-инструменты
+        # (check_local_store) должны смотреть в неё, а не в рабочий каталог.
+        executor_map = {
+            name: build_executor(dataclasses.replace(entry, home=home))
+            for name, entry in cfg.executors.items()
+        }
+    else:
+        executor_map = dict(executors)
     chain = [executor_map[name] for name in cfg.chain if name in executor_map]
     if not chain:
         raise ValueError("ни один исполнитель из chain не построен")

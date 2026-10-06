@@ -145,6 +145,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="показать план (задачи × исполнители × retry), ничего не запуская",
     )
+    run_parser.add_argument(
+        "--skills-dir",
+        action="append",
+        default=None,
+        help="дополнительный каталог скилов Kimi (повторяемый флаг)",
+    )
 
     recover_parser = subparsers.add_parser(
         "recover",
@@ -226,6 +232,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("--workers должно быть ≥ 1", file=sys.stderr)
                 return 2
             config = dataclasses.replace(config, workers=args.workers)
+        if args.skills_dir:
+            executors = {
+                name: dataclasses.replace(
+                    entry, skills_dirs=[*args.skills_dir, *entry.skills_dirs]
+                )
+                for name, entry in config.executors.items()
+            }
+            config = dataclasses.replace(config, executors=executors)
 
         if args.dry_run:
             tasks = list_pending_tasks(store, statuses=_parse_statuses(args.status))

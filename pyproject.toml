@@ -22,19 +22,31 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+    "httpx>=0.28.1",
     "pydantic>=2.10",
     "pyyaml>=6.0.3",
 ]
 
 [project.scripts]
 geodocs-agent = "geodocs.agent.cli:main"
+geodocs-agent-mcp = "geodocs.agent.mcp:main"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.27",
+]
 
 [dependency-groups]
 test = [
     "pytest>=8.3",
+    "respx>=0.23.1",
+    "geodocs[mcp]",
 ]
 lint = [
     "ruff>=0.8.4",
+]
+dev = [
+    "pytest-asyncio>=1.4.0",
 ]
 
 [tool.uv]

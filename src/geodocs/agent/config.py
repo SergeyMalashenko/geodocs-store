@@ -54,7 +54,11 @@ class AgentConfigError(ValueError):
 
 @dataclass(frozen=True)
 class ExecutorConfig:
-    """Одна запись executors.<name> из agents.yaml."""
+    """Одна запись executors.<name> из agents.yaml.
+
+    Поле `home` — внутреннее: раннер подставляет сюда GEODOCS_HOME общей
+    базы перед построением исполнителя (agents.yaml его не описывает).
+    """
 
     name: str
     type: str
@@ -62,6 +66,9 @@ class ExecutorConfig:
     args: list[str]
     timeout_seconds: int
     quota_patterns: list[str] = field(default_factory=list)
+    skills_dirs: list[str] = field(default_factory=list)
+    mcp: bool = True
+    home: Path | None = None
 
     def compiled_quota_patterns(self) -> list[re.Pattern[str]]:
         """Компилирует regex квот; битый паттерн — понятная ошибка конфига."""
@@ -215,6 +222,23 @@ def _parse_config(raw: dict[str, Any], *, source: str) -> AgentTierConfig:
             raise AgentConfigError(
                 f"{source}: {label}: поле 'quota_patterns' должно быть списком строк"
             )
+        skills_dirs = entry.get("skills_dirs", [])
+        if not isinstance(skills_dirs, list) or not all(
+            isinstance(item, str) for item in skills_dirs
+        ):
+            raise AgentConfigError(
+                f"{source}: {label}: поле 'skills_dirs' должно быть списком строк"
+            )
+        mcp_raw = entry.get("mcp", True)
+        mcp_enabled = True
+        if isinstance(mcp_raw, dict):
+            mcp_enabled = bool(mcp_raw.get("enabled", True))
+        elif isinstance(mcp_raw, bool):
+            mcp_enabled = mcp_raw
+        else:
+            raise AgentConfigError(
+                f"{source}: {label}: поле 'mcp' должно быть bool или {{enabled: bool}}"
+            )
         cfg = ExecutorConfig(
             name=name,
             type=entry_type,
@@ -222,6 +246,8 @@ def _parse_config(raw: dict[str, Any], *, source: str) -> AgentTierConfig:
             args=list(args),
             timeout_seconds=timeout,
             quota_patterns=list(patterns),
+            skills_dirs=list(skills_dirs),
+            mcp=mcp_enabled,
         )
         cfg.compiled_quota_patterns()  # валидация regex до первого запуска
         executors[name] = cfg

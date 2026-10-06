@@ -51,6 +51,9 @@ executors:
     quota_patterns:        # regex по stdout+stderr неуспешного запуска
       - "(?i)quota"
       - "429"
+    skills_dirs: []        # доп. каталоги скилов (пакетные подключены всегда)
+    mcp:                   # MCP-инструменты порталов (по умолчанию включены)
+      enabled: true
 ```
 
 Семантика прогона: проход = перебор исполнителей в порядке `chain`, успех =
@@ -96,6 +99,48 @@ executors:
 `Executor` (`name`, `provider`, `run(prompt, workdir) -> ExecutionResult`)
 с нуля и бросает `QuotaExceeded` при исчерпании квоты — цепочка сама
 переключится на следующего исполнителя.
+
+### Kimi harness: статические инструменты вместо свободного веб-поиска
+
+KimiExecutor перед запуском материализует в рабочем каталоге задачи
+(GEODOCS_HOME) `.kimi-code/mcp.json` — stdio MCP-сервер `geodocs-agent-mcp`
+(`python -m geodocs.agent.mcp`, зависимость extra: `pip install 'geodocs[mcp]'`),
+гарантирует workspace-trust каталога для Kimi CLI и добавляет в argv
+`--skills-dir` с пакетными скилами. Агент работает по промпту строго в
+порядке: локальная база → инструменты порталов → скачивание → свободный
+веб-поиск (последнее звено) → MANIFEST.
+
+Инструменты MCP (параллельный поиск, ошибка одного портала не роняет
+остальные):
+
+| Инструмент | Что делает |
+|---|---|
+| `check_local_store` | Статус версии в SQLite-базе: не искать то, что есть |
+| `search_document` | Поиск по всем порталам реестра, merged-кандидаты с тегами |
+| `download_document` | Скачивание в inbox задачи; HTML отклоняется |
+| `fetch_page` | HTML→текст + ссылки на файлы (муниципальные сайты без API) |
+
+Порталы-доноры (`src/geodocs/agent/portals/`, регистрация —
+`register_portal`): **meganorm** (нормо-база; fetch отказывается сохранять
+HTML-карточки — ловушка прошлых прогонов), **cntd** (полный текст блоками
+с docs.cntd.ru), **fgistp** (карточки ФГИС ТП по URL из веб-поиска;
+эвристика — доступ к материалам с сентября 2026 ограничен,
+[разбор](https://geo-risk.ru/blog/fgis-tp-zakryli-dostup-chto-delat)),
+**pravo** (publication.pravo.gov.ru), **mosreg** (data.mosreg.ru),
+**municipal** (универсальный читатель страниц, без поиска). Парсеры
+поисковой выдачи meganorm/pravo/mosreg — эвристики, требуют проверки на
+пилоте; HTTP-адаптеры покрыты тестами с замоканной выдачей.
+
+Новый портал/скил — без правок ядра: адаптер по протоколу `PortalAdapter`
+(`name`, `async search`, `async fetch`) → `register_portal("имя", ...)`
+(доступен в `search_document` автоматически); скил — каталог с `SKILL.md`
+(frontmatter: name, description, whenToUse) в `--skills-dir`-каталоге
+или в `skills_dirs` агента. Скилы пакета: meganorm-search, cntd-search,
+municipal-navigation, document-requisites.
+
+Порядок fallback целиком: статика (rgis-карточки) → агентные
+инструменты/порталы → свободный веб-поиск агентом → ручной добор
+(`manual_required`, виден в `recover`).
 
 Статический sync (`geodocs sync`) живёт в pyrgis-agents (`sync_parcel_documents`:
 RGIS discovery → `register_ref` → `link_parcel` → fetch). Отдельного реестра

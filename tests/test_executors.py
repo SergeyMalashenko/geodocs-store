@@ -51,6 +51,12 @@ AMENDMENT_DATE = "2026-04-09"
 _INBOX_RE = re.compile(r"каталог (\S+)")
 
 
+@pytest.fixture(autouse=True)
+def _kimi_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """KimiExecutor пишет workspace-trust: изолируем от реального ~/.kimi-code."""
+    monkeypatch.setenv("KIMI_HOME", str(tmp_path / "kimi-home"))
+
+
 def _pdf_bytes(size: int = 33_000) -> bytes:
     """Минимальный PDF ручной сборки, добитый до размера над порогом гейта."""
     body = (
@@ -452,7 +458,12 @@ def test_kimi_executor_invokes_subprocess(
     monkeypatch.setattr("geodocs.agent.executors.subprocess.run", fake_run)
     executor = KimiExecutor(_kimi_cfg())
     result = executor.run("промт", tmp_path)
-    assert calls[0]["argv"] == ["kimi", "-p", "промт"]
+    argv = calls[0]["argv"]
+    assert argv[0] == "kimi"
+    assert argv[-1] == "промт"
+    assert "--skills-dir" in argv  # harness: пакетные скилы
+    assert argv.index("-p") > argv.index("--skills-dir")  # флаги до -p
+    assert (tmp_path / ".kimi-code" / "mcp.json").exists()  # harness: MCP
     assert Path(calls[0]["cwd"]) == tmp_path
     assert calls[0]["capture_output"] is True
     assert result.returncode == 0 and result.stdout == "ok"
