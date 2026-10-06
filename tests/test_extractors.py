@@ -494,3 +494,11 @@ def test_vri_extractor_end_to_end_html(store: DocumentStore, tmp_path: Path) -> 
     assert record.payload["counts"] == {"rows_total": 2, "rows_parsed": 2, "tables": 1}
     assert record.payload["items"][0]["code"] == "2.1*"
     assert record.payload["items"][0]["margin"] == "3"
+
+
+def test_vri_item_accepts_numeric_building_percentage():
+    """Парсер ставит число в колонку процента застройки (напр. 3 из docx)."""
+    from geodocs.extractors import VriItem
+
+    item = VriItem(row="3", code="2.1", building_percentage=3, raw="3 | 2.1 | 3")
+    assert item.building_percentage == 3

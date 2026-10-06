@@ -15,7 +15,7 @@ class VriItem(BaseModel):
     name: str | None = None
     area_min: int | float | str | None = None
     area_max: int | float | str | None = None
-    building_percentage: str | None = None
+    building_percentage: int | float | str | None = None
     margin: int | float | str | None = None
     raw: str
 
