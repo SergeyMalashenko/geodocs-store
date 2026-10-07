@@ -364,6 +364,7 @@ def test_stats(store: DocumentStore) -> None:
         "version_files": 0,
         "parcel_documents": 0,
         "extractions": 0,
+        "query_log": 0,
     }
     version_id = store.register_ref(_base_ref())
     store.link_parcel(CN_1, version_id)
@@ -382,7 +383,41 @@ def test_stats(store: DocumentStore) -> None:
         "version_files": 0,
         "parcel_documents": 1,
         "extractions": 1,
+        "query_log": 0,
     }
+
+
+def test_query_log_roundtrip(store: DocumentStore) -> None:
+    entry_id = store.log_query(
+        query="Верни зоны ВРИ",
+        status="success",
+        version_ids=[1, 2],
+        data={"zone": "Ж-1"},
+        evidence=[{"version_id": 1, "page": 3, "quote": "Зона Ж-1"}],
+        answer_text="Зона Ж-1",
+        executor="hermes",
+        duration_seconds=1.5,
+        warnings=["w"],
+    )
+    (entry,) = store.query_log_entries()
+    assert entry.id == entry_id
+    assert entry.query == "Верни зоны ВРИ"
+    assert entry.status == "success"
+    assert entry.version_ids == [1, 2]
+    assert entry.data == {"zone": "Ж-1"}
+    assert entry.evidence == [{"version_id": 1, "page": 3, "quote": "Зона Ж-1"}]
+    assert entry.answer_text == "Зона Ж-1"
+    assert entry.executor == "hermes"
+    assert entry.duration_seconds == 1.5
+    assert entry.warnings == ["w"]
+
+    # минимальная запись: data=None, пустые версии — тоже логируется
+    store.log_query(query="q2", status="not_found", version_ids=[])
+    entries = store.query_log_entries()
+    assert [item.query for item in entries] == ["q2", "Верни зоны ВРИ"]
+    assert entries[0].data is None
+    assert entries[0].evidence == []
+    assert entries[0].executor is None
 
 
 def test_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

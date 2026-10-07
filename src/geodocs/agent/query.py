@@ -9,7 +9,9 @@
 Протокол ответа агента: последняя строка stdout `=== RESULT === {json}`;
 один retry при невалидном JSON/схеме, затем status=failed. Правило
 промпта — extract, don't infer: каждое поле data подтверждается цитатой
-в evidence.
+в evidence. Каждый терминальный исход (success … failed) фиксируется
+в таблице query_log базы — аудит запросов; сбой записи аудита не роняет
+ответ, а добавляет warning.
 """
 
 from __future__ import annotations
@@ -156,6 +158,30 @@ def _resolve_home(home: str | Path | None) -> Path:
     if home is None:
         return Path(os.environ.get("GEODOCS_HOME", str(Path.home() / ".geodocs")))
     return Path(home)
+
+
+def _persist_query(home_path: Path, query: str, result: QueryResult) -> None:
+    """Аудит запроса в query_log; сбой записи — warning, не исключение."""
+    try:
+        store = DocumentStore(
+            home_path / "geodocs.sqlite3", files_dir=home_path / "files"
+        )
+        try:
+            store.log_query(
+                query=query,
+                status=result.status.value,
+                version_ids=[doc.version_id for doc in result.documents],
+                data=result.data,
+                evidence=[item.model_dump(mode="json") for item in result.evidence],
+                answer_text=result.answer_text,
+                executor=result.executor,
+                duration_seconds=result.duration_seconds,
+                warnings=result.warnings,
+            )
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001 — аудит не должен ронять ответ
+        result.warnings.append(f"query_log не записан: {exc}")
 
 
 def _version_row(store: DocumentStore, version_id: int) -> dict[str, Any] | None:
@@ -315,11 +341,13 @@ def query_documents(
     finally:
         store.close()
     if not resolved:
-        return QueryResult(
+        result = QueryResult(
             status=QueryStatus.NOT_FOUND,
             warnings=warnings or ["ни один документ не резолвится в базе"],
             duration_seconds=time.monotonic() - started,
         )
+        _persist_query(home_path, query, result)
+        return result
 
     executor = _ask_executor(home_path, executor_name, config)
     prompt = build_query_prompt(resolved, query, response_schema)
@@ -363,13 +391,15 @@ def query_documents(
 
     duration = time.monotonic() - started
     if error is not None or payload is None:
-        return QueryResult(
+        result = QueryResult(
             status=QueryStatus.FAILED,
             documents=resolved,
             executor=executor.name,
             warnings=[*warnings, error or "агент не вернул результат"],
             duration_seconds=duration,
         )
+        _persist_query(home_path, query, result)
+        return result
 
     result = _payload_to_result(payload, resolved, executor.name, warnings, duration)
     if (
@@ -382,4 +412,5 @@ def query_documents(
             "evidence_required: success/partial без цитат понижен до"
             " insufficient_evidence"
         )
+    _persist_query(home_path, query, result)
     return result

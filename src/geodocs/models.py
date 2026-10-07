@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DocType(str, Enum):
@@ -132,6 +132,26 @@ class ExtractionRecord(BaseModel):
     payload: dict[str, Any]
     extractor: str
     confidence: float | None = None
+    created_at: datetime
+
+
+class QueryLogRecord(BaseModel):
+    """Запись аудита семантического запроса query_documents.
+
+    Хранит исход каждого запроса (включая not_found/failed), чтобы по базе
+    было видно, что спрашивали, у каких версий и с каким результатом.
+    """
+
+    id: int
+    query: str
+    status: str
+    version_ids: list[int]
+    data: Any = None
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    answer_text: str | None = None
+    executor: str | None = None
+    duration_seconds: float | None = None
+    warnings: list[str] = Field(default_factory=list)
     created_at: datetime
 
 

@@ -186,6 +186,7 @@ def acquire_documents(
         }
         chain = [executors[name] for name in cfg.chain if name in executors]
         if not chain:
+            store.set_fetch_status(task.version_id, FetchStatus.SEARCH_FAILED)
             return AcquireResult(
                 status=AcquireStatus.FAILED,
                 warnings=["ни один исполнитель из chain не построен"],
@@ -206,6 +207,13 @@ def acquire_documents(
             AcquireStatus.NOT_FOUND
             if result.status == "not_found"
             else AcquireStatus.FAILED
+        )
+        # версия не должна оставаться pending: попытка состоялась
+        store.set_fetch_status(
+            task.version_id,
+            FetchStatus.NOT_FOUND
+            if result.status == "not_found"
+            else FetchStatus.SEARCH_FAILED,
         )
         if result.error:
             warnings.append(result.error)

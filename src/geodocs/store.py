@@ -23,6 +23,7 @@ from .models import (
     FetchStatus,
     FileRecord,
     ParcelDocumentLink,
+    QueryLogRecord,
     SourceName,
     VersionFileRecord,
 )
@@ -98,6 +99,19 @@ CREATE TABLE IF NOT EXISTS extractions (
     created_at TEXT NOT NULL,
     UNIQUE (version_id, zone_code, kind)
 );
+CREATE TABLE IF NOT EXISTS query_log (
+    id INTEGER PRIMARY KEY,
+    query TEXT NOT NULL,
+    status TEXT NOT NULL,
+    version_ids_json TEXT NOT NULL,
+    data_json TEXT,
+    evidence_json TEXT NOT NULL,
+    answer_text TEXT,
+    executor TEXT,
+    duration_seconds REAL,
+    warnings_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 _TABLES = (
@@ -107,6 +121,7 @@ _TABLES = (
     "version_files",
     "parcel_documents",
     "extractions",
+    "query_log",
 )
 
 _CHUNK_SIZE = 1024 * 1024
@@ -165,6 +180,16 @@ def _to_extraction(row: sqlite3.Row) -> ExtractionRecord:
     data = _row_dict(row)
     data["payload"] = json.loads(data.pop("payload_json"))
     return ExtractionRecord(**data)
+
+
+def _to_query_log(row: sqlite3.Row) -> QueryLogRecord:
+    record = _row_dict(row)
+    record["version_ids"] = json.loads(record.pop("version_ids_json"))
+    data_json = record.pop("data_json")
+    record["data"] = json.loads(data_json) if data_json is not None else None
+    record["evidence"] = json.loads(record.pop("evidence_json"))
+    record["warnings"] = json.loads(record.pop("warnings_json"))
+    return QueryLogRecord(**record)
 
 
 class DocumentStore:
@@ -638,6 +663,51 @@ class DocumentStore:
             (version_id,),
         ).fetchall()
         return [_to_extraction(row) for row in rows]
+
+    def log_query(
+        self,
+        *,
+        query: str,
+        status: str,
+        version_ids: list[int],
+        data: Any = None,
+        evidence: list[dict[str, Any]] | None = None,
+        answer_text: str | None = None,
+        executor: str | None = None,
+        duration_seconds: float | None = None,
+        warnings: list[str] | None = None,
+    ) -> int:
+        """Фиксирует исход семантического запроса query_documents (аудит)."""
+        with self.connection:
+            cursor = self.connection.execute(
+                "INSERT INTO query_log"
+                " (query, status, version_ids_json, data_json, evidence_json,"
+                "  answer_text, executor, duration_seconds, warnings_json,"
+                "  created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    query,
+                    status,
+                    json.dumps(version_ids),
+                    json.dumps(data, ensure_ascii=False)
+                    if data is not None
+                    else None,
+                    json.dumps(evidence or [], ensure_ascii=False),
+                    answer_text,
+                    executor,
+                    duration_seconds,
+                    json.dumps(warnings or [], ensure_ascii=False),
+                    _utcnow(),
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def query_log_entries(self, *, limit: int = 100) -> list[QueryLogRecord]:
+        """Последние записи аудита запросов, новые первыми."""
+        rows = self.connection.execute(
+            "SELECT * FROM query_log ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [_to_query_log(row) for row in rows]
 
     def get_document(self, document_id: int) -> DocumentRecord | None:
         """Документ по id."""

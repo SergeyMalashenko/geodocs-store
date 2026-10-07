@@ -658,3 +658,136 @@ def test_acquire_agent_downloads(
         assert version.fetch_status is FetchStatus.DOWNLOADED
     finally:
         store.close()
+
+
+def _version_status(home: Path, number: str, version_date: str) -> FetchStatus:
+    store = DocumentStore(home / "geodocs.sqlite3")
+    try:
+        version = store.find_version(
+            municipality="Городской округ Тестовый",
+            doc_type=DocType.PZZ,
+            number=number,
+            version_date=version_date,
+        )
+        assert version is not None
+        return version.fetch_status
+    finally:
+        store.close()
+
+
+def test_acquire_agent_not_found_marks_version(
+    home: Path, stub_type: None
+) -> None:
+    _STUB_BEHAVIORS["hermes"] = lambda prompt, workdir: _exec_result(
+        '=== MANIFEST === {"status": "not_found", "files": [],'
+        ' "source_url": null, "notes": "нет такого", "steps_used": 3}'
+    )
+    result = acquire_documents(
+        "Городской округ Тестовый",
+        "pzz",
+        number="88",
+        version_date="2026-02-01",
+        home=home,
+        config=_stub_config(),
+    )
+    assert result.status is AcquireStatus.NOT_FOUND
+    # попытка состоялась: версия не остаётся pending
+    assert _version_status(home, "88", "2026-02-01") is FetchStatus.NOT_FOUND
+
+
+def test_acquire_agent_error_marks_search_failed(
+    home: Path, stub_type: None
+) -> None:
+    _STUB_BEHAVIORS["hermes"] = lambda prompt, workdir: ExecutionResult(
+        stdout="", stderr="boom", returncode=1, duration_seconds=0.1
+    )
+    result = acquire_documents(
+        "Городской округ Тестовый",
+        "pzz",
+        number="89",
+        version_date="2026-02-01",
+        home=home,
+        config=_stub_config(),
+    )
+    assert result.status is AcquireStatus.FAILED
+    assert _version_status(home, "89", "2026-02-01") is FetchStatus.SEARCH_FAILED
+
+
+def test_acquire_without_executor_marks_search_failed(
+    home: Path, stub_type: None
+) -> None:
+    empty_chain = AgentTierConfig(
+        chain=["missing"], executors={}, retry_attempts=1, retry_pause_seconds=0
+    )
+    result = acquire_documents(
+        "Городской округ Тестовый",
+        "pzz",
+        number="90",
+        version_date="2026-02-01",
+        home=home,
+        config=empty_chain,
+    )
+    assert result.status is AcquireStatus.FAILED
+    assert _version_status(home, "90", "2026-02-01") is FetchStatus.SEARCH_FAILED
+
+
+# ---------------------------------------------------------------------------
+# query_log: аудит запросов query_documents
+# ---------------------------------------------------------------------------
+
+
+def test_query_documents_persists_query_log(
+    home: Path, seeded: int, stub_type: None
+) -> None:
+    _STUB_BEHAVIORS["hermes"] = lambda prompt, workdir: _exec_result(
+        _result_line(
+            {
+                "status": "success",
+                "data": {"territorial_zone": "Ж-1"},
+                "evidence": [{"version_id": seeded, "quote": "Зона Ж-1"}],
+                "answer_text": "Ж-1",
+            }
+        )
+    )
+    result = query_documents(
+        [seeded], "Верни территориальную зону", home=home, config=_stub_config()
+    )
+    assert result.status is QueryStatus.SUCCESS
+
+    store = DocumentStore(home / "geodocs.sqlite3")
+    try:
+        (entry,) = store.query_log_entries()
+        assert entry.query == "Верни территориальную зону"
+        assert entry.status == "success"
+        assert entry.version_ids == [seeded]
+        assert entry.data == {"territorial_zone": "Ж-1"}
+        assert entry.evidence[0]["quote"] == "Зона Ж-1"
+        assert entry.answer_text == "Ж-1"
+        assert entry.executor == "hermes"
+    finally:
+        store.close()
+
+
+def test_query_documents_log_records_negative_outcomes(
+    home: Path, seeded: int, stub_type: None
+) -> None:
+    # запрос без резолвящихся документов — исполнитель не вызывается
+    result = query_documents([999_999], "зона", home=home, config=_stub_config())
+    assert result.status is QueryStatus.NOT_FOUND
+
+    # падение протокола: агент не вернул RESULT ни в попытке, ни в retry
+    _STUB_BEHAVIORS["hermes"] = lambda prompt, workdir: _exec_result(
+        "ответил прозой без маркера"
+    )
+    failed = query_documents([seeded], "зона", home=home, config=_stub_config())
+    assert failed.status is QueryStatus.FAILED
+
+    store = DocumentStore(home / "geodocs.sqlite3")
+    try:
+        entries = store.query_log_entries()
+        assert [entry.status for entry in entries] == ["failed", "not_found"]
+        assert entries[0].version_ids == [seeded]
+        assert entries[1].version_ids == []  # unresolved ref
+        assert entries[0].executor == "hermes"
+    finally:
+        store.close()

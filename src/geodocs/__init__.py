@@ -31,6 +31,7 @@ from .models import (
     FetchStatus,
     FileRecord,
     ParcelDocumentLink,
+    QueryLogRecord,
     SourceName,
     VersionFileRecord,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "FetchStatus",
     "FileRecord",
     "ParcelDocumentLink",
+    "QueryLogRecord",
     "QueryResult",
     "QueryStatus",
     "SourceName",
