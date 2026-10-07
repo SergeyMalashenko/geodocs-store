@@ -30,6 +30,7 @@ dependencies = [
 [project.scripts]
 geodocs-agent = "geodocs.agent.cli:main"
 geodocs-agent-mcp = "geodocs.agent.mcp:main"
+geodocs-mcp = "geodocs.server:main"
 
 [project.optional-dependencies]
 mcp = [

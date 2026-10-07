@@ -2,7 +2,7 @@
 
 LLM-агент не запускается: исполнитель тестового типа "stub" (как в
 test_ask.py); инструменты find_document/import_document/read_document и
-search_document_text вызываются напрямую, HTTP мокается respx.
+приватный _search_version_text вызываются напрямую, HTTP мокается respx.
 """
 
 from __future__ import annotations
@@ -39,10 +39,10 @@ from geodocs.agent import (
 )
 from geodocs.agent.mcp import (
     McpContext,
+    _search_version_text,
     find_document_impl,
     import_document_impl,
     read_document_impl,
-    search_document_text_impl,
 )
 from geodocs.agent.portals import Candidate, DocQuery
 from geodocs.agent.query import (
@@ -389,21 +389,21 @@ def test_query_documents_ref_by_requisites(
 
 
 def test_search_document_text_pages(home: Path, seeded: int) -> None:
-    result = search_document_text_impl(_ctx(home), seeded, "многоэтажная")
+    result = _search_version_text(_ctx(home), seeded, "многоэтажная")
     assert result["files_searched"] == 1
     (hit,) = result["hits"]
     assert hit["page"] == 1
     assert "жилая застройка многоэтажная" in hit["snippet"]
     # вторая «страница» (после \f)
-    result = search_document_text_impl(_ctx(home), seeded, "ЛЭП")
+    result = _search_version_text(_ctx(home), seeded, "ЛЭП")
     (hit,) = result["hits"]
     assert hit["page"] == 2
     # несколько совпадений на одной странице — несколько hit'ов
-    result = search_document_text_impl(_ctx(home), seeded, "застройк")
+    result = _search_version_text(_ctx(home), seeded, "застройк")
     assert len(result["hits"]) == 2
     assert all(hit["page"] == 1 for hit in result["hits"])
     # нет совпадений
-    assert search_document_text_impl(_ctx(home), seeded, "несуществующее")[
+    assert _search_version_text(_ctx(home), seeded, "несуществующее")[
         "hits"
     ] == []
 
@@ -791,3 +791,268 @@ def test_query_documents_log_records_negative_outcomes(
         assert entries[0].executor == "hermes"
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# static fast-path: extractions раньше LLM
+# ---------------------------------------------------------------------------
+
+_VRI_TABLE_PAYLOAD = {
+    "zone_code": "Ж-1",
+    "zone_name": "Зона жилой застройки",
+    "source_file": "2026-04-09_регламент.txt",
+    "items": [{"row": "1", "code": "2.1", "name": "ИЖС", "raw": "2.1 ИЖС"}],
+    "counts": {},
+}
+
+
+def _seed_vri_table(store: DocumentStore, version_id: int) -> None:
+    """Перезаписывает extraction зоны Ж-1 payload'ом, валидным для VriTable."""
+    store.upsert_extraction(
+        version_id,
+        zone_code="Ж-1",
+        kind=ExtractionKind.VRI_TABLE,
+        origin=ExtractionOrigin.FETCHED_FILE,
+        payload=dict(_VRI_TABLE_PAYLOAD),
+        extractor="test",
+    )
+
+
+def _fail_behavior(prompt: str, workdir: Path) -> ExecutionResult:
+    raise AssertionError("LLM-исполнитель не должен запускаться")
+
+
+def test_query_static_vri_hit_without_llm(
+    home: Path, store: DocumentStore, seeded: int, stub_type: None
+) -> None:
+    _seed_vri_table(store, seeded)
+    _STUB_BEHAVIORS["hermes"] = _fail_behavior
+    result = query_documents(
+        [seeded], "Верни ВРИ зоны Ж-1", home=home, config=_stub_config()
+    )
+    assert result.status is QueryStatus.SUCCESS
+    assert result.executor == "static:vri"
+    (zone,) = result.data["zones"]
+    assert zone["zone_code"] == "Ж-1"
+    assert zone["found"] is True
+    assert zone["extractions"][0]["table"]["items"][0]["code"] == "2.1"
+    assert result.evidence[0].version_id == seeded
+    assert result.evidence[0].file == "2026-04-09_регламент.txt"
+
+    audit = DocumentStore(home / "geodocs.sqlite3")
+    try:
+        (entry,) = audit.query_log_entries()
+        assert entry.executor == "static:vri"
+        assert entry.status == "success"
+        assert entry.version_ids == [seeded]
+    finally:
+        audit.close()
+
+
+def test_query_static_vri_partial(
+    home: Path, store: DocumentStore, seeded: int, stub_type: None
+) -> None:
+    _seed_vri_table(store, seeded)  # зоны ТЦ-2 в txt-файле нет
+    _STUB_BEHAVIORS["hermes"] = _fail_behavior
+    result = query_documents(
+        [seeded], "Верни ВРИ зон Ж-1 и ТЦ-2", home=home, config=_stub_config()
+    )
+    assert result.status is QueryStatus.PARTIAL
+    assert result.executor == "static:vri"
+    found = {zone["zone_code"]: zone["found"] for zone in result.data["zones"]}
+    assert found == {"Ж-1": True, "ТЦ-2": False}
+
+
+def test_query_static_miss_goes_to_llm(
+    home: Path, seeded: int, stub_type: None
+) -> None:
+    calls: list[str] = []
+
+    def behavior(prompt: str, workdir: Path) -> ExecutionResult:
+        calls.append(prompt)
+        return _exec_result(_result_line({"status": "not_found", "data": None}))
+
+    _STUB_BEHAVIORS["hermes"] = behavior
+    result = query_documents(
+        [seeded], "Кто утвердил документ?", home=home, config=_stub_config()
+    )
+    assert result.status is QueryStatus.NOT_FOUND
+    assert result.executor == "hermes"
+    assert len(calls) == 1
+
+
+def test_query_static_vri_broken_cache_goes_to_llm(
+    home: Path, seeded: int, stub_type: None
+) -> None:
+    # seeded несёт vri_table с payload не-VriTable: static:vri не сработал
+    _STUB_BEHAVIORS["hermes"] = lambda prompt, workdir: _exec_result(
+        _result_line(
+            {
+                "status": "success",
+                "data": {"zone": "Ж-1"},
+                "evidence": [{"quote": "Зона Ж-1"}],
+            }
+        )
+    )
+    result = query_documents(
+        [seeded], "Верни ВРИ зоны Ж-1", home=home, config=_stub_config()
+    )
+    assert result.status is QueryStatus.SUCCESS
+    assert result.executor == "hermes"
+    assert any("static:vri" in warning for warning in result.warnings)
+
+
+def test_query_static_schema_mismatch_goes_to_llm(
+    home: Path, store: DocumentStore, seeded: int, stub_type: None
+) -> None:
+    _seed_vri_table(store, seeded)
+    _STUB_BEHAVIORS["hermes"] = lambda prompt, workdir: _exec_result(
+        _result_line(
+            {
+                "status": "success",
+                "data": {"custom": 1},
+                "evidence": [{"quote": "q"}],
+            }
+        )
+    )
+    result = query_documents(
+        [seeded],
+        "Верни ВРИ зоны Ж-1",
+        response_schema={"type": "object", "required": ["custom"]},
+        home=home,
+        config=_stub_config(),
+    )
+    assert result.status is QueryStatus.SUCCESS
+    assert result.executor == "hermes"
+    assert result.data == {"custom": 1}
+    assert any("response_schema" in warning for warning in result.warnings)
+
+
+def test_query_static_zouit_hit_without_llm(
+    home: Path, store: DocumentStore, seeded: int, stub_type: None
+) -> None:
+    store.upsert_extraction(
+        seeded,
+        zone_code="50:11:0020310:43-зз-1",
+        kind=ExtractionKind.ZOUIT_REGIME_TEXT,
+        origin=ExtractionOrigin.PROVIDER_ATTRIBUTES,
+        payload={
+            "registry_number": "50:11:0020310:43-зз-1",
+            "name": "Охранная зона ЛЭП",
+            "restrictions": "запрет капитального строительства",
+        },
+        extractor="nspd-test",
+    )
+    _STUB_BEHAVIORS["hermes"] = _fail_behavior
+    result = query_documents(
+        [seeded], "Верни режимы и ограничения ЗОУИТ", home=home, config=_stub_config()
+    )
+    assert result.status is QueryStatus.SUCCESS
+    assert result.executor == "static:zouit"
+    (regime,) = result.data["regimes"]
+    assert regime["name"] == "Охранная зона ЛЭП"
+    assert regime["version_id"] == seeded
+    assert result.evidence[0].quote == "Охранная зона ЛЭП"
+
+
+# ---------------------------------------------------------------------------
+# acquire_documents: статическая ступень по document_sources
+# ---------------------------------------------------------------------------
+
+_RGIS_PEEKABOO = "https://rgis.mosreg.ru/v3/peekaboo"
+_RGIS_FILES_API = "https://rgis.mosreg.ru/v3/swagger/geoportal/card/files"
+
+
+def _mock_rgis_card() -> None:
+    respx.post(_RGIS_PEEKABOO).mock(return_value=httpx.Response(200))
+    respx.get(_RGIS_FILES_API).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "title": "ПЗЗ текстовая часть",
+                    "children": [
+                        {
+                            "title": "pzz_944.pdf",
+                            "ext": "pdf",
+                            "size": "2 Мб",
+                            "uri": "./files/pzz_944.pdf",
+                        }
+                    ],
+                }
+            ],
+        )
+    )
+    respx.get("https://rgis.mosreg.ru/v3/files/pzz_944.pdf").mock(
+        return_value=httpx.Response(
+            200, content=_BIG_PDF, headers={"content-type": "application/pdf"}
+        )
+    )
+
+
+def test_acquire_static_rgis_without_agent(
+    home: Path, store: DocumentStore, stub_type: None
+) -> None:
+    version_id = store.register_ref(_ref("944", AMENDMENT_DATE))
+    _STUB_BEHAVIORS["hermes"] = _fail_behavior
+    with respx.mock:
+        _mock_rgis_card()
+        result = acquire_documents(
+            MUNICIPALITY,
+            "pzz",
+            number="944",
+            version_date=AMENDMENT_DATE,
+            home=home,
+            config=_stub_config(),
+        )
+    assert result.status is AcquireStatus.ACQUIRED
+    assert [ref.version_id for ref in result.refs] == [version_id]
+
+    check = DocumentStore(home / "geodocs.sqlite3")
+    try:
+        version = check.find_version(
+            municipality=MUNICIPALITY,
+            doc_type=DocType.PZZ,
+            number="944",
+            version_date=AMENDMENT_DATE,
+        )
+        assert version is not None
+        assert version.fetch_status is FetchStatus.DOWNLOADED
+        (file,) = check.files_for_version(version_id)
+        assert file.title == "pzz_944.pdf"
+    finally:
+        check.close()
+
+
+def test_acquire_static_failure_falls_back_to_agent(
+    home: Path, store: DocumentStore, stub_type: None
+) -> None:
+    store.register_ref(_ref("944", AMENDMENT_DATE))
+
+    def behavior(prompt: str, workdir: Path) -> ExecutionResult:
+        match = re.search(r"каталог (\S+)", prompt)
+        assert match, "в промпте должен быть каталог inbox"
+        inbox = Path(match.group(1))
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "2026-04-09_pzz_944.pdf").write_bytes(_BIG_PDF)
+        return _exec_result(
+            '=== MANIFEST === {"status": "found",'
+            ' "files": ["2026-04-09_pzz_944.pdf"],'
+            ' "source_url": "https://test-adm.ru/docs/pzz_944.pdf",'
+            ' "notes": "ok", "steps_used": 2}'
+        )
+
+    _STUB_BEHAVIORS["hermes"] = behavior
+    with respx.mock:
+        respx.post(_RGIS_PEEKABOO).mock(return_value=httpx.Response(200))
+        respx.get(_RGIS_FILES_API).mock(return_value=httpx.Response(404))
+        result = acquire_documents(
+            MUNICIPALITY,
+            "pzz",
+            number="944",
+            version_date=AMENDMENT_DATE,
+            home=home,
+            config=_stub_config(),
+        )
+    assert result.status is AcquireStatus.ACQUIRED
+    assert any("static:rgis" in warning for warning in result.warnings)

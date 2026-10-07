@@ -12,12 +12,20 @@
 в evidence. Каждый терминальный исход (success … failed) фиксируется
 в таблице query_log базы — аудит запросов; сбой записи аудита не роняет
 ответ, а добавляет warning.
+
+Перед вызовом LLM срабатывает детерминированный fast-path
+_try_static_answer (инвариант «extractions раньше полного текста»):
+коды зон в запросе + версии ПЗЗ → VriExtractor (executor "static:vri"),
+ключевые слова режима ЗОУИТ → готовые extractions zouit_regime_text
+(executor "static:zouit"). Статический ответ, не прошедший
+response_schema, отклоняется с warning — запрос уходит обычному LLM-пути.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from enum import Enum
@@ -26,13 +34,16 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ..models import DocumentRef
+from ..extractors import VriExtractor, VriTable
+from ..models import DocType, DocumentRef, ExtractionKind
 from ..store import DocumentStore
 from .ask import _ask_executor
 from .config import AgentTierConfig
 
 RESULT_MARKER = "=== RESULT ==="
 _UNKNOWN_VERSION_DATE = "unknown"  # как в store.py: редакция без даты
+_ZONE_CODE_RE = re.compile(r"[А-ЯЁA-Z]{1,4}-\d{1,2}")  # как в agent/mcp.py
+_ZOUIT_QUERY_RE = re.compile(r"зоуит|режим|ограничен", re.IGNORECASE)
 
 _TERMINAL_STATUSES = (
     "success",
@@ -260,6 +271,149 @@ def _validate_data(data: Any, schema: dict[str, Any]) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Детерминированный fast-path: extractions раньше LLM и полного текста
+# ---------------------------------------------------------------------------
+
+
+def _vri_quote(table: VriTable) -> str | None:
+    """Цитата provenance для статической таблицы ВРИ."""
+    if table.zone_description:
+        return table.zone_description
+    if table.items:
+        return table.items[0].raw
+    return None
+
+
+def _static_vri(
+    store: DocumentStore,
+    documents: list[ResolvedDocument],
+    zones: list[str],
+    warnings: list[str],
+) -> QueryResult | None:
+    """ВРИ по кодам зон: VriExtractor по версиям ПЗЗ (кэширует в extractions)."""
+    pzz = [doc for doc in documents if doc.doc_type == DocType.PZZ.value]
+    if not zones or not pzz:
+        return None
+    extractor = VriExtractor(store)
+    data_zones: dict[str, dict[str, Any]] = {
+        zone: {"zone_code": zone, "found": False, "extractions": []} for zone in zones
+    }
+    evidence: list[Evidence] = []
+    for doc in pzz:
+        try:
+            outcomes = extractor.extract_version(doc.version_id, zones)
+        except Exception as exc:  # noqa: BLE001 — статика не роняет запрос
+            warnings.append(f"static:vri по версии {doc.version_id} не сработал: {exc}")
+            continue
+        for zone, outcome in zip(zones, outcomes, strict=True):
+            item: dict[str, Any] = {
+                "version_id": doc.version_id,
+                "status": outcome.status,
+            }
+            if outcome.extractor:
+                item["extractor"] = outcome.extractor
+            if outcome.table is not None:
+                item["table"] = outcome.table.model_dump(mode="json")
+                data_zones[zone]["found"] = True
+                evidence.append(
+                    Evidence(
+                        version_id=doc.version_id,
+                        file=outcome.table.source_file,
+                        section=zone,
+                        quote=_vri_quote(outcome.table),
+                    )
+                )
+            elif outcome.detail:
+                item["detail"] = outcome.detail
+            data_zones[zone]["extractions"].append(item)
+    found = sum(1 for entry in data_zones.values() if entry["found"])
+    if not found:
+        return None
+    status = QueryStatus.SUCCESS if found == len(zones) else QueryStatus.PARTIAL
+    return QueryResult(
+        status=status,
+        data={"zones": list(data_zones.values())},
+        evidence=evidence,
+        answer_text=(
+            f"Таблицы ВРИ извлечены детерминированно: зоны с данными —"
+            f" {found} из {len(zones)}"
+        ),
+        documents=documents,
+        executor="static:vri",
+    )
+
+
+def _static_zouit(
+    store: DocumentStore, documents: list[ResolvedDocument]
+) -> QueryResult | None:
+    """Режимы ЗОУИТ из готовых extractions zouit_regime_text указанных версий."""
+    regimes: list[dict[str, Any]] = []
+    evidence: list[Evidence] = []
+    for doc in documents:
+        for record in store.extractions_for_version(doc.version_id):
+            if record.kind is not ExtractionKind.ZOUIT_REGIME_TEXT:
+                continue
+            regimes.append(
+                {
+                    "version_id": doc.version_id,
+                    "zone_code": record.zone_code,
+                    **record.payload,
+                }
+            )
+            evidence.append(
+                Evidence(
+                    version_id=doc.version_id,
+                    section=record.zone_code or None,
+                    quote=record.payload.get("name"),
+                )
+            )
+    if not regimes:
+        return None
+    return QueryResult(
+        status=QueryStatus.SUCCESS,
+        data={"regimes": regimes},
+        evidence=evidence,
+        answer_text=(
+            f"Режимы ЗОУИТ взяты из готовых extractions: {len(regimes)} шт."
+        ),
+        documents=documents,
+        executor="static:zouit",
+    )
+
+
+def _try_static_answer(
+    store: DocumentStore,
+    documents: list[ResolvedDocument],
+    query: str,
+    response_schema: dict[str, Any] | None,
+    warnings: list[str],
+) -> QueryResult | None:
+    """Детерминированный ответ из extractions до вызова LLM; None = промах.
+
+    Ответ, не прошедший response_schema, отклоняется с warning — дальше
+    запрос идёт обычным LLM-путём.
+    """
+    result: QueryResult | None = None
+    zones = sorted({code.upper() for code in _ZONE_CODE_RE.findall(query.upper())})
+    if zones:
+        result = _static_vri(store, documents, zones, warnings)
+    if result is None and _ZOUIT_QUERY_RE.search(query):
+        result = _static_zouit(store, documents)
+    if result is None:
+        return None
+    if response_schema is not None:
+        error = _validate_data(result.data, response_schema)
+        if error is not None:
+            warnings.append(
+                f"статический ответ {result.executor} не прошёл response_schema:"
+                f" {error}"
+            )
+            return None
+    result.warnings = warnings
+    return result
+
+
 def _check_payload(
     payload: dict[str, Any], response_schema: dict[str, Any] | None
 ) -> str | None:
@@ -323,13 +477,16 @@ def query_documents(
     config: AgentTierConfig | None = None,
     workdir: Path | None = None,
 ) -> QueryResult:
-    """Семантический запрос к документам локальной базы через LLM-агента.
+    """Семантический запрос к документам локальной базы.
 
-    documents — version_id (int) и/или DocumentRef (по version_id либо
-    реквизитам municipality/doc_type/number/version_date). response_schema —
-    JSON Schema словарём: data валидируется по ней (один retry при ошибке).
-    evidence_required: success/partial без цитат понижается до
-    insufficient_evidence механически.
+    Сначала — детерминированный fast-path по готовым extractions
+    (_try_static_answer: static:vri/static:zouit, без LLM); промах —
+    LLM-агент с read_document. documents — version_id (int) и/или
+    DocumentRef (по version_id либо реквизитам municipality/doc_type/
+    number/version_date). response_schema — JSON Schema словарём: data
+    валидируется по ней (один retry при ошибке). evidence_required:
+    success/partial без цитат понижается до insufficient_evidence
+    механически.
     """
     started = time.monotonic()
     home_path = _resolve_home(home)
@@ -338,6 +495,11 @@ def query_documents(
     )
     try:
         resolved, warnings = _resolve_documents(store, documents)
+        static = (
+            _try_static_answer(store, resolved, query, response_schema, warnings)
+            if resolved
+            else None
+        )
     finally:
         store.close()
     if not resolved:
@@ -348,6 +510,10 @@ def query_documents(
         )
         _persist_query(home_path, query, result)
         return result
+    if static is not None:
+        static.duration_seconds = time.monotonic() - started
+        _persist_query(home_path, query, static)
+        return static
 
     executor = _ask_executor(home_path, executor_name, config)
     prompt = build_query_prompt(resolved, query, response_schema)

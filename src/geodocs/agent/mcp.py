@@ -10,10 +10,9 @@
     read_document    чтение локального документа: карточка, готовые
                      extractions, релевантные фрагменты текста
 
-Низкоуровневые блоки (search_document_impl, download_document_impl,
-fetch_page_impl, read_document_text_impl и др.) остаются в модуле как
-внутренние строительные кирпичи и для тестов — в build_server они не
-регистрируются. Запуск — stdio:
+Внутренние примитивы (_search_portals, _download_to_inbox, _fetch_page,
+_read_version_text, _search_version_text) — строительные кирпичи трёх
+инструментов; в build_server они не регистрируются. Запуск — stdio:
 
     GEODOCS_AGENT_INBOX=<inbox> GEODOCS_HOME=<home> geodocs-agent-mcp
 
@@ -76,11 +75,11 @@ class McpContext:
 
 
 # ---------------------------------------------------------------------------
-# Низкоуровневые блоки: порталы и скачивание (внутренние, тестируются напрямую)
+# Внутренние примитивы: порталы и скачивание
 # ---------------------------------------------------------------------------
 
 
-async def search_document_impl(
+async def _search_portals(
     municipality: str,
     doc_type: str,
     number: str,
@@ -127,7 +126,7 @@ async def search_document_impl(
     }
 
 
-async def download_document_impl(
+async def _download_to_inbox(
     ctx: McpContext,
     url: str,
     portal: str | None = None,
@@ -166,7 +165,7 @@ async def download_document_impl(
     }
 
 
-async def fetch_page_impl(ctx: McpContext, url: str) -> dict[str, Any]:
+async def _fetch_page(ctx: McpContext, url: str) -> dict[str, Any]:
     """Читает HTML-страницу: текст в .txt, найденные файлы — в inbox."""
     ctx.inbox.mkdir(parents=True, exist_ok=True)
     adapter = get_portal("municipal")
@@ -183,43 +182,8 @@ async def fetch_page_impl(ctx: McpContext, url: str) -> dict[str, Any]:
     }
 
 
-def check_local_store_impl(
-    ctx: McpContext,
-    doc_type: str,
-    number: str,
-    version_date: str,
-) -> dict[str, Any]:
-    """Статус версии в локальной базе: чтобы не искать то, что уже есть."""
-    store = _open_store(ctx)
-    try:
-        rows = store.connection.execute(
-            "SELECT v.id, v.fetch_status, v.source_provider, v.file_path,"
-            " v.source_url, d.municipality, d.number, d.doc_type, v.version_date"
-            " FROM document_versions v JOIN documents d ON d.id = v.document_id"
-            " WHERE d.doc_type = ? AND d.number = ? AND v.version_date = ?"
-            " ORDER BY v.id",
-            (doc_type, number, version_date),
-        ).fetchall()
-    finally:
-        store.close()
-    if not rows:
-        return {"known": False}
-    versions = [
-        {
-            "version_id": row["id"],
-            "municipality": row["municipality"],
-            "fetch_status": row["fetch_status"],
-            "source_provider": row["source_provider"],
-            "file_path": row["file_path"],
-            "source_url": row["source_url"],
-        }
-        for row in rows
-    ]
-    return {"known": True, "versions": versions}
-
-
 # ---------------------------------------------------------------------------
-# Низкоуровневые блоки: чтение локальной базы
+# Внутренние примитивы: чтение локальной базы
 # ---------------------------------------------------------------------------
 
 
@@ -227,67 +191,6 @@ def _open_store(ctx: McpContext) -> Any:
     from ..store import DocumentStore
 
     return DocumentStore(ctx.home / "geodocs.sqlite3", files_dir=ctx.home / "files")
-
-
-def find_documents_impl(
-    ctx: McpContext,
-    query: str,
-    doc_type: str | None = None,
-    limit: int = 10,
-) -> dict[str, Any]:
-    """Поиск версий в локальной базе по подстроке: номер, название, муниципалитет."""
-    store = _open_store(ctx)
-    try:
-        like = f"%{query}%"
-        sql = (
-            "SELECT v.id, d.municipality, d.doc_type, d.number, v.version_date,"
-            " d.title, v.fetch_status FROM document_versions v"
-            " JOIN documents d ON d.id = v.document_id"
-            " WHERE (d.number LIKE ? OR d.title LIKE ? OR d.municipality LIKE ?)"
-        )
-        params: list[Any] = [like, like, like]
-        if doc_type:
-            sql += " AND d.doc_type = ?"
-            params.append(doc_type)
-        sql += " ORDER BY v.id LIMIT ?"
-        params.append(max(1, min(limit, 50)))
-        rows = store.connection.execute(sql, params).fetchall()
-    finally:
-        store.close()
-    return {
-        "versions": [
-            {
-                "version_id": row["id"],
-                "municipality": row["municipality"],
-                "doc_type": row["doc_type"],
-                "number": row["number"],
-                "version_date": row["version_date"],
-                "title": row["title"],
-                "fetch_status": row["fetch_status"],
-            }
-            for row in rows
-        ]
-    }
-
-
-def document_files_impl(ctx: McpContext, version_id: int) -> dict[str, Any]:
-    """Файлы версии: путь, название, размер — что читать через read_document."""
-    store = _open_store(ctx)
-    try:
-        files = store.files_for_version(version_id)
-    finally:
-        store.close()
-    return {
-        "files": [
-            {
-                "index": index,
-                "path": file.file_path,
-                "title": file.title,
-                "size": file.size_bytes,
-            }
-            for index, file in enumerate(files)
-        ]
-    }
 
 
 _XML_TAG_RE = re.compile(r"<[^>]+>")
@@ -329,7 +232,7 @@ def _file_text(path: Path) -> str:
     raise ValueError(f"неподдерживаемый тип файла: {suffix or '(нет расширения)'}")
 
 
-def read_document_text_impl(
+def _read_version_text(
     ctx: McpContext,
     version_id: int,
     file_index: int = 0,
@@ -364,7 +267,7 @@ def read_document_text_impl(
     }
 
 
-def search_document_text_impl(
+def _search_version_text(
     ctx: McpContext,
     version_id: int,
     pattern: str,
@@ -421,16 +324,6 @@ def search_document_text_impl(
                 if len(hits) >= limit:
                     return {"hits": hits, "files_searched": searched}
     return {"hits": hits, "files_searched": searched}
-
-
-def document_extractions_impl(ctx: McpContext, version_id: int) -> dict[str, Any]:
-    """Уже извлечённые структурированные фрагменты версии (таблицы ВРИ и др.)."""
-    store = _open_store(ctx)
-    try:
-        records = store.extractions_for_version(version_id)
-    finally:
-        store.close()
-    return {"extractions": [_serialize_extraction(record) for record in records]}
 
 
 def _serialize_extraction(record: Any) -> dict[str, Any]:
@@ -500,7 +393,7 @@ async def find_document_impl(
     if any(version["fetch_status"] == "downloaded" for version in versions):
         return {"local": True, "versions": versions}
     if doc_type and number:
-        external = await search_document_impl(
+        external = await _search_portals(
             municipality, doc_type, number, version_date or "", title
         )
         return {"local": False, "versions": versions, **external}
@@ -536,13 +429,13 @@ async def import_document_impl(
     ctx.inbox.mkdir(parents=True, exist_ok=True)
     before = {p.name for p in ctx.inbox.iterdir() if p.is_file()}
     try:
-        result = await download_document_impl(ctx, url, portal=portal)
+        result = await _download_to_inbox(ctx, url, portal=portal)
         downloaded = [Path(result["path"])]
     except PortalError as exc:
         if "HTML" not in str(exc):
             return {"error": str(exc)}
         try:
-            await fetch_page_impl(ctx, url)
+            await _fetch_page(ctx, url)
         except (PortalError, httpx.HTTPError) as page_exc:
             return {"error": f"{exc}; страница тоже не открылась: {page_exc}"}
         after = {p.name for p in ctx.inbox.iterdir() if p.is_file()}
@@ -687,7 +580,7 @@ def read_document_impl(
         result["extractions"] = [
             _serialize_extraction(record) for record in extractions
         ]
-        preview = read_document_text_impl(ctx, version_id, 0, max_chars)
+        preview = _read_version_text(ctx, version_id, 0, max_chars)
         result["text_preview"] = preview if "error" not in preview else None
         return result
 
@@ -701,7 +594,7 @@ def read_document_impl(
     words = [w for w in re.split(r"[^\w-]+", query, flags=re.UNICODE) if len(w) >= 3]
     if words:
         pattern = "|".join(re.escape(word) for word in words[:8])
-        search = search_document_text_impl(
+        search = _search_version_text(
             ctx, version_id, pattern, context_chars=1200, max_hits=8
         )
         result["fragments"] = search.get("hits", [])

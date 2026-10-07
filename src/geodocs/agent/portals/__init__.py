@@ -21,6 +21,7 @@ def _register_builtin_portals() -> None:
     from .mosreg import MosregAdapter
     from .municipal import MunicipalAdapter
     from .pravo import PravoAdapter
+    from .rgis import RgisAdapter
 
     register_portal("cntd", CntdAdapter)
     register_portal("fgistp", FgistpAdapter)
@@ -28,6 +29,7 @@ def _register_builtin_portals() -> None:
     register_portal("mosreg", MosregAdapter)
     register_portal("municipal", MunicipalAdapter)
     register_portal("pravo", PravoAdapter)
+    register_portal("rgis", RgisAdapter)
 
 
 _register_builtin_portals()

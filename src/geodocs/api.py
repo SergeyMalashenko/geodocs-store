@@ -8,13 +8,18 @@
 
 acquire_documents — cache-first по инварианту (не по решению LLM): версия
 с fetch_status=downloaded возвращается из базы без внешнего поиска; промах
-уходит в агентный ярус (run_task), после которого lookup повторяется.
+по известной версии уходит в статическую ступень (порталы по
+document_sources: файлы карточек РГИС, полный текст cntd), затем —
+в агентный ярус (run_task), после которого lookup повторяется.
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import os
+import tempfile
+from collections.abc import Awaitable, Callable
 from enum import Enum
 from pathlib import Path
 
@@ -22,6 +27,9 @@ from pydantic import BaseModel, Field
 
 from .agent.config import AgentTierConfig, load_config
 from .agent.executors import build_executor
+from .agent.portals import Candidate, PortalError
+from .agent.portals.cntd import CntdAdapter
+from .agent.portals.rgis import RgisAdapter
 from .agent.query import QueryResult, query_documents
 from .agent.runner import run_task
 from .agent.tasks import AgentTask
@@ -98,6 +106,109 @@ def _row_to_ref(row: dict[str, object]) -> DocumentRef:
     )
 
 
+# ---------------------------------------------------------------------------
+# Статическая ступень: порталы по document_sources версии (до агентного яруса)
+# ---------------------------------------------------------------------------
+
+StaticFetcher = Callable[[DocumentStore, int, str], Awaitable[int]]
+
+
+async def _fetch_rgis_card(store: DocumentStore, version_id: int, object_id: str) -> int:
+    """Документные файлы карточки РГИС → save_file; вернёт число сохранённых."""
+    if not object_id.isdigit():
+        raise PortalError(f"rgis: source_object_id {object_id!r} не похож на id карточки")
+    adapter = RgisAdapter()
+    try:
+        downloads = await adapter.fetch_card_documents(int(object_id))
+    finally:
+        await adapter.aclose()
+    for item in downloads:
+        store.save_file(
+            version_id,
+            item.content,
+            filename=item.title,
+            title=item.title,
+            section=item.section,
+            source_url=item.uri,
+            source_provider=SourceName.RGIS,
+        )
+    return len(downloads)
+
+
+async def _fetch_cntd_text(store: DocumentStore, version_id: int, object_id: str) -> int:
+    """Полный текст документа docs.cntd.ru → save_file; 0/1 сохранённых."""
+    if object_id.startswith("http"):
+        candidate = Candidate(url=object_id, title=object_id, portal="cntd")
+    else:
+        candidate = Candidate(
+            url=f"https://docs.cntd.ru/document/{object_id}",
+            title=f"CNTD {object_id}",
+            portal="cntd",
+            meta={"document_id": object_id},
+        )
+    adapter = CntdAdapter()
+    try:
+        with tempfile.TemporaryDirectory(prefix="geodocs-cntd-") as tmp:
+            path = await adapter.fetch(candidate, Path(tmp))
+            data, name = path.read_bytes(), path.name
+    finally:
+        await adapter.aclose()
+    store.save_file(
+        version_id,
+        data,
+        filename=name,
+        title=name,
+        section="cntd",
+        source_url=candidate.url,
+        source_provider=SourceName.CNTD,
+    )
+    return 1
+
+
+_STATIC_FETCHERS: dict[str, StaticFetcher] = {
+    SourceName.RGIS.value: _fetch_rgis_card,
+    SourceName.CNTD.value: _fetch_cntd_text,
+}
+
+
+async def _static_acquire_async(
+    store: DocumentStore, version_id: int, warnings: list[str]
+) -> bool:
+    """Статические порталы по document_sources версии; True = версия скачана."""
+    for source, object_id in store.source_refs_for_version(version_id):
+        fetcher = _STATIC_FETCHERS.get(source)
+        if fetcher is None:
+            continue
+        try:
+            saved = await fetcher(store, version_id, object_id)
+        except Exception as exc:  # noqa: BLE001 — статика не роняет acquire
+            warnings.append(
+                f"static:{source} для версии {version_id} не сработал: {exc}"
+            )
+            continue
+        if saved:
+            return True
+    return False
+
+
+def _try_static_acquire(
+    store: DocumentStore, rows: list[dict[str, object]], warnings: list[str]
+) -> bool:
+    """Детерминированная ступень между cache-miss и агентным ярусом.
+
+    True — хотя бы одна известная версия скачана статическими порталами.
+    """
+    for row in reversed(rows):
+        version_id = int(row["version_id"])  # type: ignore[arg-type]
+        try:
+            if asyncio.run(_static_acquire_async(store, version_id, warnings)):
+                return True
+        except RuntimeError as exc:  # вызов из работающего event loop
+            warnings.append(f"статическая ступень пропущена: {exc}")
+            return False
+    return False
+
+
 def acquire_documents(
     municipality: str,
     doc_type: str,
@@ -111,9 +222,11 @@ def acquire_documents(
 ) -> AcquireResult:
     """Обеспечивает наличие документа в локальном хранилище (cache-first).
 
-    Хранилище проверяется всегда первым; внешний поиск (агентный ярус) —
-    только при промахе и только если задан номер документа. Неудача — не
-    исключение, а статус not_found/failed с причиной в warnings.
+    Хранилище проверяется всегда первым; дальше — статическая ступень по
+    document_sources известной версии (файлы карточек РГИС, полный текст
+    cntd) и только потом агентный ярус (внешний поиск, нужен номер
+    документа). Неудача — не исключение, а статус not_found/failed
+    с причиной в warnings.
     """
     home_path = _resolve_home(home)
     store = DocumentStore(
@@ -136,6 +249,15 @@ def acquire_documents(
         warnings: list[str] = []
         if rows:
             warnings.append("документ известен базе, но файл не скачан")
+            if _try_static_acquire(store, rows, warnings):
+                refs = [
+                    _row_to_ref(row)
+                    for row in _lookup_versions(
+                        store, municipality, doc_type, number, version_date
+                    )
+                    if row["fetch_status"] == FetchStatus.DOWNLOADED.value
+                ]
+                return AcquireResult(refs=refs, status=AcquireStatus.ACQUIRED)
         if not allow_agent:
             return AcquireResult(
                 status=AcquireStatus.NOT_FOUND,
@@ -202,7 +324,9 @@ def acquire_documents(
                 for row in rows
                 if row["fetch_status"] == FetchStatus.DOWNLOADED.value
             ]
-            return AcquireResult(refs=refs, status=AcquireStatus.ACQUIRED)
+            return AcquireResult(
+                refs=refs, status=AcquireStatus.ACQUIRED, warnings=warnings
+            )
         status = (
             AcquireStatus.NOT_FOUND
             if result.status == "not_found"

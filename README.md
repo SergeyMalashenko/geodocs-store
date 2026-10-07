@@ -79,6 +79,24 @@ result = query_documents(
 вызываются внутри. `ask_document` (см. ниже) остаётся тонким сахаром для
 discovery-Q&A без перечня документов.
 
+## Публичный MCP-сервер `geodocs-mcp`
+
+Те же два метода наружу по MCP (зависимость extra: `pip install
+'geodocs[mcp]'`):
+
+```bash
+GEODOCS_HOME=$HOME/.geodocs uv run geodocs-mcp \
+    [--transport stdio|streamable-http] [--host 127.0.0.1] [--port 8006] [--path /mcp]
+```
+
+| Инструмент | Что делает |
+|---|---|
+| `acquire_documents(municipality, doc_type, number=None, version_date=None, title=None)` | cache-first → статические порталы по `document_sources` (файлы карточек РГИС, полный текст cntd) → агентный ярус |
+| `query_documents(version_ids, query, response_schema=None)` | статический fast-path (`static:vri` / `static:zouit`) → LLM-агент |
+
+Оба вызова потенциально долгие (агентный ярус — минуты) и выполняются
+через `asyncio.to_thread`: клиенту нужен большой read-timeout.
+
 ## Агентный ярус
 
 Документы, которые статика не добрала (`not_found`, `pending`), добывают
@@ -176,10 +194,9 @@ extra: `pip install 'geodocs[mcp]'`); `auth.json`/`.env` — симлинки н
 | `import_document` | Внешний URL (файл или HTML-страница со ссылками) → локальный документ: скачивание, гейт, регистрация в базе, возврат `version_id` |
 | `read_document` | Чтение локального документа: карточка, файлы, готовые extractions (приоритет) и релевантные фрагменты текста с номерами страниц |
 
-Низкоуровневые блоки (`search_document`, `download_document`, `fetch_page`,
-`read_document_text` и др.) остаются в `geodocs.agent.mcp` как внутренние
-строительные кирпичи и точки тестирования — в MCP-сервере они не
-регистрируются.
+Внутренние примитивы (`_search_portals`, `_download_to_inbox`, `_fetch_page`,
+`_read_version_text`, `_search_version_text`) — строительные кирпичи трёх
+инструментов в `geodocs.agent.mcp`; в MCP-сервере они не регистрируются.
 
 ### Q&A по локальной базе: `ask_document`
 
@@ -208,13 +225,15 @@ HTML-карточки — ловушка прошлых прогонов), **cnt
 эвристика — доступ к материалам с сентября 2026 ограничен,
 [разбор](https://geo-risk.ru/blog/fgis-tp-zakryli-dostup-chto-delat)),
 **pravo** (publication.pravo.gov.ru), **mosreg** (data.mosreg.ru),
+**rgis** (документные файлы карточек РГИС МО по id карточки из
+`document_sources`; поиска нет — discovery делает pyrgis-mcp),
 **municipal** (универсальный читатель страниц, без поиска). Парсеры
 поисковой выдачи meganorm/pravo/mosreg — эвристики, требуют проверки на
 пилоте; HTTP-адаптеры покрыты тестами с замоканной выдачей.
 
 Новый портал/скил — без правок ядра: адаптер по протоколу `PortalAdapter`
 (`name`, `async search`, `async fetch`) → `register_portal("имя", ...)`
-(доступен в `search_document` автоматически); скил — каталог с `SKILL.md`
+(подключается к внешнему поиску `find_document` автоматически); скил — каталог с `SKILL.md`
 (frontmatter: name, description, whenToUse) в `--skills-dir`-каталоге
 или в `skills_dirs` агента. Скилы пакета: meganorm-search, cntd-search,
 municipal-navigation, document-requisites.

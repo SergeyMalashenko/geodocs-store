@@ -2,7 +2,7 @@
 
 Встроенные адаптеры регистрируются в portals/__init__.py. Новый портал
 добавляется кодом без правок ядра: адаптер по протоколу PortalAdapter →
-register_portal("имя", фабрика) → доступен в MCP search_document.
+register_portal("имя", фабрика) → доступен в find_document / import_document.
 """
 
 from __future__ import annotations

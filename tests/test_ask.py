@@ -1,9 +1,9 @@
-"""Тесты Q&A поверх локальной базы: ask_document и read-only MCP-инструменты.
+"""Тесты Q&A поверх локальной базы: ask_document и чтение версии.
 
 LLM-агент не запускается: для ask_document используется исполнитель
-тестового типа "stub" (реестр, как в test_executors), read-only инструменты
-(find_documents/document_files/read_document_text/document_extractions)
-вызываются напрямую, без транспорта MCP.
+тестового типа "stub" (реестр, как в test_executors), чтение версии
+проверяется facade read_document/find_document и приватным
+_read_version_text напрямую, без транспорта MCP.
 """
 
 from __future__ import annotations
@@ -35,10 +35,9 @@ from geodocs.agent import (
 )
 from geodocs.agent.mcp import (
     McpContext,
-    document_extractions_impl,
-    document_files_impl,
-    find_documents_impl,
-    read_document_text_impl,
+    _read_version_text,
+    find_document_impl,
+    read_document_impl,
 )
 
 MUNICIPALITY = "Городской округ Солнечногорск"
@@ -204,7 +203,7 @@ def test_ask_document_returns_answer(
 
 
 # ---------------------------------------------------------------------------
-# Read-only MCP-инструменты поверх посеянного store
+# Чтение версии поверх посеянного store (facade + приватный примитив)
 # ---------------------------------------------------------------------------
 
 
@@ -212,16 +211,20 @@ def _ctx(home: Path) -> McpContext:
     return McpContext(inbox=home / "inbox", home=home)
 
 
-def test_find_documents_impl_finds_seeded(home: Path, seeded: int) -> None:
-    found = find_documents_impl(_ctx(home), "944")
+@pytest.mark.asyncio()
+async def test_find_document_finds_seeded(home: Path, seeded: int) -> None:
+    found = await find_document_impl(
+        _ctx(home), MUNICIPALITY, "pzz", "944", AMENDMENT_DATE
+    )
+    assert found["local"] is True
     (version,) = found["versions"]
     assert version["version_id"] == seeded
     assert version["number"] == "944"
     assert version["municipality"] == MUNICIPALITY
 
 
-def test_document_files_impl_lists_one_file(home: Path, seeded: int) -> None:
-    result = document_files_impl(_ctx(home), seeded)
+def test_read_document_lists_one_file(home: Path, seeded: int) -> None:
+    result = read_document_impl(_ctx(home), seeded)
     (entry,) = result["files"]
     assert entry["index"] == 0
     assert entry["path"].endswith("2026-04-09_регламент.txt")
@@ -229,21 +232,21 @@ def test_document_files_impl_lists_one_file(home: Path, seeded: int) -> None:
     assert entry["size"] > 0
 
 
-def test_read_document_text_impl_reads_txt(home: Path, seeded: int) -> None:
-    result = read_document_text_impl(_ctx(home), seeded)
+def test_read_version_text_reads_txt(home: Path, seeded: int) -> None:
+    result = _read_version_text(_ctx(home), seeded)
     assert "error" not in result
     assert result["text"] == _TXT_CONTENT
     assert result["total_chars"] == len(_TXT_CONTENT)
     assert result["truncated"] is False
 
 
-def test_read_document_text_impl_index_out_of_range(home: Path, seeded: int) -> None:
-    result = read_document_text_impl(_ctx(home), seeded, file_index=5)
+def test_read_version_text_index_out_of_range(home: Path, seeded: int) -> None:
+    result = _read_version_text(_ctx(home), seeded, file_index=5)
     assert "error" in result
 
 
-def test_document_extractions_impl_returns_payload(home: Path, seeded: int) -> None:
-    result = document_extractions_impl(_ctx(home), seeded)
+def test_read_document_returns_extraction_payload(home: Path, seeded: int) -> None:
+    result = read_document_impl(_ctx(home), seeded)
     (extraction,) = result["extractions"]
     assert extraction["zone_code"] == "Ж-1"
     assert extraction["kind"] == "vri_table"

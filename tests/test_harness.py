@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import subprocess
 import sys
@@ -32,10 +33,10 @@ from geodocs.agent import MANIFEST_MARKER, HermesExecutor, run_pending
 from geodocs.agent.config import ExecutorConfig
 from geodocs.agent.mcp import (
     McpContext,
-    check_local_store_impl,
-    download_document_impl,
-    fetch_page_impl,
-    search_document_impl,
+    _download_to_inbox,
+    _fetch_page,
+    _search_portals,
+    find_document_impl,
 )
 from geodocs.agent.portals import (
     Candidate,
@@ -44,6 +45,13 @@ from geodocs.agent.portals import (
     get_portal,
     list_portals,
     register_portal,
+)
+from geodocs.agent.portals.rgis import (
+    CardFileSection,
+    RgisAdapter,
+    _card_id,
+    _parse_size_bytes,
+    select_files,
 )
 from geodocs.agent.prompt import build_prompt
 from geodocs.agent.tasks import AgentTask
@@ -162,7 +170,15 @@ def test_portal_registry_unknown() -> None:
 
 def test_builtin_portals_registered() -> None:
     names = list_portals()
-    for expected in ("meganorm", "cntd", "fgistp", "pravo", "mosreg", "municipal"):
+    for expected in (
+        "meganorm",
+        "cntd",
+        "fgistp",
+        "pravo",
+        "mosreg",
+        "municipal",
+        "rgis",
+    ):
         assert expected in names
 
 
@@ -438,7 +454,7 @@ async def test_mcp_search_merges_portals_and_isolates_errors(
         respx.get("https://meganorm.ru/Search2/search").mock(
             return_value=httpx.Response(200, text=_MEGANORM_RESULTS)
         )
-        result = await search_document_impl(
+        result = await _search_portals(
             municipality=SHATURA_QUERY.municipality,
             doc_type=SHATURA_QUERY.doc_type,
             number=SHATURA_QUERY.number,
@@ -462,7 +478,7 @@ async def test_mcp_download_direct_refuses_html(tmp_path: Path) -> None:
                 headers={"content-type": "application/pdf"},
             )
         )
-        ok = await download_document_impl(ctx, "https://shatura-adm.ru/pzz/1069.pdf")
+        ok = await _download_to_inbox(ctx, "https://shatura-adm.ru/pzz/1069.pdf")
     assert ok["size"] == len(_PDF_BYTES)
     assert Path(ok["path"]).exists()
 
@@ -474,7 +490,7 @@ async def test_mcp_download_direct_refuses_html(tmp_path: Path) -> None:
             )
         )
         with pytest.raises(PortalError, match="HTML-страницу"):
-            await download_document_impl(ctx2, "https://shatura-adm.ru/page")
+            await _download_to_inbox(ctx2, "https://shatura-adm.ru/page")
 
 
 @pytest.mark.asyncio()
@@ -496,18 +512,28 @@ async def test_mcp_fetch_page(tmp_path: Path) -> None:
                 200, content=b"\x89PNG", headers={"content-type": "image/png"}
             )
         )
-        result = await fetch_page_impl(ctx, "https://shatura-adm.ru/pzz")
+        result = await _fetch_page(ctx, "https://shatura-adm.ru/pzz")
     assert "изменения № 1069" in result["text_preview"]
     assert "pzz_1069.pdf" in result["inbox_files"]
 
 
-def test_mcp_check_local_store(tmp_path: Path) -> None:
+@pytest.mark.asyncio()
+async def test_find_document_reports_known_not_downloaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Статус версии в локальной базе виден через facade find_document."""
+    import geodocs.agent.mcp as mcp_module
+
+    monkeypatch.setattr(mcp_module, "list_portals", list)
     home = tmp_path / "home"
     store = DocumentStore(home / "geodocs.sqlite3", files_dir=home / "files")
     ctx = McpContext(inbox=home / "inbox", home=home)
 
-    unknown = check_local_store_impl(ctx, "pzz", "1069", "2026-06-08")
-    assert unknown == {"known": False}
+    unknown = await find_document_impl(
+        ctx, "Муниципальный округ Шатура", "pzz", "1069", "2026-06-08"
+    )
+    assert unknown["versions"] == []
+    assert unknown["local"] is False
 
     ref = DocumentRef(
         municipality="Муниципальный округ Шатура",
@@ -523,8 +549,10 @@ def test_mcp_check_local_store(tmp_path: Path) -> None:
     store.set_fetch_status(version_id, FetchStatus.NOT_FOUND)
     store.close()
 
-    known = check_local_store_impl(ctx, "pzz", "1069", "2026-06-08")
-    assert known["known"] is True
+    known = await find_document_impl(
+        ctx, "Муниципальный округ Шатура", "pzz", "1069", "2026-06-08"
+    )
+    assert known["local"] is False
     (version,) = known["versions"]
     assert version["municipality"] == "Муниципальный округ Шатура"
     assert version["fetch_status"] == "not_found"
@@ -639,10 +667,10 @@ def test_hermes_executor_materializes_config_and_skills(
     assert seen[0]["env"]["HERMES_HOME"] == str(hermes_home)
 
 
-def test_runner_passes_home_and_mcp_check_local_store_sees_it(
+def test_runner_passes_home_and_mcp_find_document_sees_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Сквозная проводка: раннер подставляет home → config.yaml → check_local_store."""
+    """Сквозная проводка: раннер подставляет home → config.yaml → find_document."""
     home = tmp_path / "home"
     store = DocumentStore(home / "geodocs.sqlite3", files_dir=home / "files")
     version_id = store.register_ref(
@@ -695,11 +723,18 @@ def test_runner_passes_home_and_mcp_check_local_store_sees_it(
     assert env["GEODOCS_HOME"] == str(home)  # не рабочий каталог, а home базы
 
     # хендлер с окружением из config.yaml видит версию реального хранилища
+    import geodocs.agent.mcp as mcp_module
+
+    monkeypatch.setattr(mcp_module, "list_portals", list)
     ctx = McpContext(
         inbox=Path(env["GEODOCS_AGENT_INBOX"]), home=Path(env["GEODOCS_HOME"])
     )
-    found = check_local_store_impl(ctx, "pzz", "1069", "2026-06-08")
-    assert found["known"] is True
+    found = asyncio.run(
+        find_document_impl(
+            ctx, "Муниципальный округ Шатура", "pzz", "1069", "2026-06-08"
+        )
+    )
+    assert found["local"] is False
     assert found["versions"][0]["fetch_status"] == "not_found"
 
 
@@ -815,3 +850,146 @@ def test_prompt_orders_tools_before_web_search() -> None:
     assert order == sorted(order), "инструменты должны идти раньше веб-поиска"
     assert "=== MANIFEST ===" in prompt
     assert prompt.rstrip().endswith("}")
+
+
+# ---------------------------------------------------------------------------
+# Адаптер РГИС: файлы карточек (geoportal/card/files)
+# ---------------------------------------------------------------------------
+
+_RGIS_CARD_FILES = [
+    {
+        "title": "ПЗЗ текстовая часть",
+        "children": [
+            {
+                "title": "Постановление 1069.pdf",
+                "ext": "pdf",
+                "size": "8702 Кб",
+                "uri": "./files/p1069.pdf",
+            },
+            {
+                "title": "Постановление 1069.pdf.sig",
+                "ext": "sig",
+                "size": "1 Кб",
+                "uri": "./files/p1069.sig",
+            },
+        ],
+    },
+    {
+        "title": "ПЗЗ Графическая часть",
+        "children": [
+            {
+                "title": "Карта зон.pdf",
+                "ext": "pdf",
+                "size": "12 Мб",
+                "uri": "./files/map.pdf",
+            },
+        ],
+    },
+    {
+        "title": "Градостроительные регламенты",
+        "children": [
+            {
+                "title": "регламент Ж-1.docx",
+                "ext": "docx",
+                "size": "500 Кб",
+                "uri": "./files/reg_zh1.docx",
+            },
+            {
+                "title": "атлас.pdf",
+                "ext": "pdf",
+                "size": "45 Мб",
+                "uri": "./files/atlas.pdf",
+            },
+        ],
+    },
+]
+
+_RGIS_SELECTED = [
+    ("Постановление 1069.pdf", "ПЗЗ текстовая часть"),
+    ("регламент Ж-1.docx", "Градостроительные регламенты"),
+]
+
+
+def _mock_rgis_files() -> None:
+    respx.post("https://rgis.mosreg.ru/v3/peekaboo").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.get("https://rgis.mosreg.ru/v3/swagger/geoportal/card/files").mock(
+        return_value=httpx.Response(200, json=_RGIS_CARD_FILES)
+    )
+    respx.get("https://rgis.mosreg.ru/v3/files/p1069.pdf").mock(
+        return_value=httpx.Response(200, content=_PDF_BYTES)
+    )
+    respx.get("https://rgis.mosreg.ru/v3/files/reg_zh1.docx").mock(
+        return_value=httpx.Response(200, content=b"PK\x03\x04" + b"D" * 100)
+    )
+
+
+def test_rgis_parse_size_bytes() -> None:
+    assert _parse_size_bytes("8702 Кб") == 8702 * 1024
+    assert _parse_size_bytes("5 Мб") == 5 * 1024**2
+    assert _parse_size_bytes("123 Б") == 123
+    assert _parse_size_bytes(None) is None
+    assert _parse_size_bytes("размер не указан") is None
+
+
+def test_rgis_select_files_skips_sig_graphic_and_oversize() -> None:
+    sections = [CardFileSection.model_validate(item) for item in _RGIS_CARD_FILES]
+    selected = select_files(sections, max_file_bytes=30 * 1024 * 1024)
+    assert [(file.title, section) for file, section in selected] == _RGIS_SELECTED
+
+
+def test_rgis_card_id_from_meta_and_url() -> None:
+    by_meta = Candidate(
+        url="https://rgis.mosreg.ru/", title="t", portal="rgis", meta={"object_id": 42}
+    )
+    assert _card_id(by_meta) == 42
+    by_url = Candidate(
+        url="https://rgis.mosreg.ru/v3/#/card/13881025700", title="t", portal="rgis"
+    )
+    assert _card_id(by_url) == 13881025700
+    with pytest.raises(PortalError, match="id карточки"):
+        _card_id(Candidate(url="https://rgis.mosreg.ru/", title="t", portal="rgis"))
+
+
+@pytest.mark.asyncio()
+async def test_rgis_fetch_card_documents_downloads_document_files() -> None:
+    adapter = get_portal("rgis")
+    assert isinstance(adapter, RgisAdapter)
+    async with adapter._client:
+        with respx.mock:
+            _mock_rgis_files()
+            downloads = await adapter.fetch_card_documents(13881025700)
+    assert [item.title for item in downloads] == [title for title, _ in _RGIS_SELECTED]
+    assert [item.section for item in downloads] == [section for _, section in _RGIS_SELECTED]
+    assert downloads[0].content == _PDF_BYTES
+
+
+@pytest.mark.asyncio()
+async def test_rgis_fetch_writes_card_files(tmp_path: Path) -> None:
+    adapter = get_portal("rgis")
+    candidate = Candidate(
+        url="https://rgis.mosreg.ru/v3/#/card/13881025700", title="ПЗЗ", portal="rgis"
+    )
+    async with adapter._client:
+        with respx.mock:
+            _mock_rgis_files()
+            first = await adapter.fetch(candidate, tmp_path)
+    assert first.name == "Постановление_1069.pdf"
+    assert (tmp_path / "регламент_Ж-1.docx").exists()
+
+
+@pytest.mark.asyncio()
+async def test_rgis_session_refresh_on_401() -> None:
+    adapter = get_portal("rgis")
+    async with adapter._client:
+        with respx.mock:
+            peekaboo = respx.post("https://rgis.mosreg.ru/v3/peekaboo").mock(
+                return_value=httpx.Response(200)
+            )
+            files_route = respx.get(
+                "https://rgis.mosreg.ru/v3/swagger/geoportal/card/files"
+            ).mock(side_effect=[httpx.Response(401), httpx.Response(200, json=[])])
+            assert await adapter.fetch_card_documents(13881025700) == []
+    assert peekaboo.call_count == 2
+    assert files_route.call_count == 2
