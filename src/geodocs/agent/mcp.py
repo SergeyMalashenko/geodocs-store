@@ -45,7 +45,7 @@ _MAX_CANDIDATES = 20
 _MAX_TEXT_CHARS = 100_000
 _PDFTOTEXT = shutil.which("pdftotext")
 _UNKNOWN_VERSION_DATE = "unknown"  # как в store.py: редакция без даты
-_ZONE_CODE_RE = re.compile(r"[А-ЯЁA-Z]{1,4}-\d{1,2}")
+_ZONE_CODE_RE = re.compile(r"[А-ЯЁA-Z]{1,4}(?:-\d+)+")
 
 
 class McpMissingError(RuntimeError):

@@ -14,9 +14,10 @@ import shutil
 import statistics
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from ._rows import HEADER_KEYWORDS, assemble_item, is_code, split_row_tokens
-from .models import ExtractionOutcome, VriItem, VriTable
+from .models import ExtractionOutcome, VriItem, VriTable, parse_number
 from .mojibake import ensure_readable
 
 EXTRACTOR_NAME = "vri-pdf-layout@1"
@@ -35,6 +36,9 @@ _CORE_RE = re.compile(
 )
 _PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
 _NAME_WINDOW = 2
+# Голый код зоны на отдельной строке — заголовок секции КРТ-подобного layout
+# (без слова «ЗОНА»): «КРТ-3-63» над таблицей параметров и списком ВРИ.
+_ZONE_BARE_RE = re.compile(r"^\s*[А-ЯA-ZЁ]{1,4}(?:-\d+)+\s*$")
 
 # Токоны чисто колоночной шапки: строка целиком из них — не кандидат в имена.
 # Словарь покрывает усечённые переносы заголовков колонок («Макси», «застро»).
@@ -143,7 +147,9 @@ def _count_cyrillic(text: str) -> int:
 def locate_section(text: str, zone_code: str) -> tuple[int, int] | None:
     """Границы секции зоны: (start, end) или None.
 
-    Конец — следующий заголовок зоны/главы или EOF.
+    Конец — следующий заголовок зоны/главы или EOF. Если заголовка
+    «КОД — ЗОНА …» нет, ищется голый код на отдельной строке (секции
+    КРТ-подобного layout); тогда концом считается и следующий голый код.
     """
     lines = text.split("\n")
     offsets: list[int] = []
@@ -153,16 +159,27 @@ def locate_section(text: str, zone_code: str) -> tuple[int, int] | None:
         position += len(line) + 1
     start_re = _section_start_re(zone_code)
     start_line = None
+    bare = False
     for index, line in enumerate(lines):
         if start_re.match(line):
             start_line = index
             break
+    if start_line is None:
+        target = zone_code.strip().casefold()
+        for index, line in enumerate(lines):
+            if _ZONE_BARE_RE.match(line) and line.strip().casefold() == target:
+                start_line = index
+                bare = True
+                break
     if start_line is None:
         return None
     end_line = len(lines)
     for index in range(start_line + 1, len(lines)):
         line = lines[index]
         if _CHAPTER_RE.match(line) or _ZONE_ANY_RE.match(line):
+            end_line = index
+            break
+        if bare and _ZONE_BARE_RE.match(line):
             end_line = index
             break
     return offsets[start_line], offsets[end_line - 1] + len(lines[end_line - 1])
@@ -341,6 +358,153 @@ def parse_section(section: str, zone_code: str, source_file: str) -> VriTable:
     )
 
 
+# ---------------------------------------------------------------------------
+# КРТ-подобный layout: голый код зоны → описание → таблица параметров
+# («Наименование параметра — Значение») → список ВРИ «код — наименование»
+# без числовых колонок (ПЗЗ Рузского муниципального округа, стр. 316+).
+# ---------------------------------------------------------------------------
+
+KRT_EXTRACTOR_NAME = "vri-pdf-layout-krt@1"
+
+_VRI_LIST_MARKER_RE = re.compile(r"виды\s+разрешенного\s+использования", re.IGNORECASE)
+_KRT_LIST_LINE_RE = re.compile(
+    r"^(?P<code>(?:\d{1,2}\.)+\d{1,2}\*{0,4})\s+(?P<name>\S.*)$"
+)
+_KRT_TYPE_PREFIX_RE = re.compile(
+    r"^\s*(?:основные|условно-?|разрешенные|вспомогательные)\s*:?\s+", re.IGNORECASE
+)
+_KRT_HEADER_TOKENS = {"тип", "ври"}
+
+
+def _krt_items(list_lines: list[str]) -> list[VriItem]:
+    """Список ВРИ «код — наименование»; переносы цепляются к предыдущему."""
+    items: list[VriItem] = []
+    for line in list_lines:
+        stripped = line.strip()
+        if not stripped or _PAGE_NUMBER_RE.match(stripped):
+            continue
+        if _VRI_LIST_MARKER_RE.search(stripped):
+            continue
+        content = " ".join(_KRT_TYPE_PREFIX_RE.sub("", line).split())
+        tokens = content.casefold().split()
+        if not content or all(token in _KRT_HEADER_TOKENS for token in tokens):
+            continue
+        match = _KRT_LIST_LINE_RE.match(content)
+        if match is not None:
+            items.append(
+                VriItem(
+                    row="",
+                    code=match.group("code"),
+                    name=match.group("name"),
+                    raw=content,
+                )
+            )
+        elif items:
+            previous = items[-1]
+            name = f"{previous.name} {content}" if previous.name else content
+            items[-1] = previous.model_copy(
+                update={"name": name, "raw": f"{previous.raw}\n{content}"}
+            )
+    return items
+
+
+def _krt_zone_params(region: str) -> dict[str, Any]:
+    """Зональные параметры из таблицы «параметр — значение» (текст в плоскую)."""
+    flat = " ".join(region.split())
+    params: dict[str, Any] = {}
+    pct = re.search(r"не более\s+(\d+(?:[.,]\d+)?)\s*%", flat, re.IGNORECASE)
+    floors = re.search(r"не более\s+(\d+)\s*этаж", flat, re.IGNORECASE)
+    if pct is not None:
+        params["building_percentage"] = (
+            f"{floors.group(1)} эт. – {pct.group(1)}%"
+            if floors is not None
+            else f"{pct.group(1)}%"
+        )
+    margin = re.search(
+        r"отступ\w*\s+от\s+границ\W{0,60}?(\d+(?:[.,]\d+)?)\s*метра",
+        flat,
+        re.IGNORECASE,
+    )
+    if margin is not None:
+        params["margin"] = parse_number(margin.group(1))
+    area = re.search(
+        r"минимальн\w*\s+размер\w*\s+земельного\s+участка\s+(\d+(?:[.,]\d+)?)\s*га",
+        flat,
+        re.IGNORECASE,
+    )
+    if area is not None:
+        params["area_min"] = int(float(area.group(1).replace(",", ".")) * 10_000)
+    qualifier = re.search(r"«([^»]+)»", flat)
+    if qualifier is not None:
+        params["qualifier"] = qualifier.group(1)
+    return params
+
+
+def _attach_zone_params(items: list[VriItem], params: dict[str, Any]) -> None:
+    """Зональные параметры — на ВРИ, названный в квалификаторе «…».
+
+    Квалификатор в тексте склеен из двух колонок («для индивидуального
+    жилищного участка строительства»), поэтому совпадение — по перекрытию
+    словаря: ≥ 80% слов наименования ВРИ есть среди слов квалификатора.
+    """
+    qualifier = params.get("qualifier")
+    if not isinstance(qualifier, str):
+        return
+    qwords = set(qualifier.casefold().split())
+    if not qwords:
+        return
+    best: tuple[float, int] | None = None
+    for index, item in enumerate(items):
+        name_words = set((item.name or "").casefold().split())
+        if not name_words:
+            continue
+        overlap = len(qwords & name_words) / len(name_words)
+        if overlap >= 0.8 and (best is None or overlap > best[0]):
+            best = (overlap, index)
+    if best is None:
+        return
+    updates = {key: value for key, value in params.items() if key != "qualifier"}
+    items[best[1]] = items[best[1]].model_copy(update=updates)
+
+
+def _krt_description(lines: list[str]) -> str | None:
+    """Описание зоны: текст между заголовком и таблицей параметров."""
+    parts: list[str] = []
+    for line in lines:
+        folded = " ".join(line.split())
+        if not folded:
+            continue
+        lowered = folded.casefold()
+        if "наименование параметра" in lowered or lowered.startswith("№"):
+            break
+        parts.append(folded)
+    if not parts:
+        return None
+    return " ".join(parts)[:2000]
+
+
+def parse_krt_section(section: str, zone_code: str, source_file: str) -> VriTable:
+    """Секция КРТ-layout: описание, зональные параметры и список ВРИ."""
+    lines = section.split("\n")
+    marker_index = next(
+        (i for i, line in enumerate(lines) if _VRI_LIST_MARKER_RE.search(line)),
+        len(lines),
+    )
+    description = _krt_description(lines[1:marker_index])
+    params = _krt_zone_params("\n".join(lines[1:marker_index]))
+    items = _krt_items(lines[marker_index:])
+    if params and items:
+        _attach_zone_params(items, params)
+    return VriTable(
+        zone_code=zone_code,
+        zone_description=description,
+        items=items,
+        counts={"rows_total": len(items), "rows_parsed": len(items)},
+        source_file=source_file,
+        confidence=0.6,
+    )
+
+
 def extract_pdf(file_path: Path, zone_code: str) -> ExtractionOutcome:
     """Полный пайплайн: pdftotext → демаппинг → секция → строки таблицы."""
     if _PDFTOTEXT is None:
@@ -370,5 +534,11 @@ def extract_pdf(file_path: Path, zone_code: str) -> ExtractionOutcome:
             extractor=EXTRACTOR_NAME,
         )
     section = text[span[0] : span[1]]
+    if _ZONE_BARE_RE.match(section.split("\n", 1)[0]):
+        krt_table = parse_krt_section(section, zone_code, str(file_path))
+        if krt_table.items:
+            return ExtractionOutcome(
+                status="extracted", table=krt_table, extractor=KRT_EXTRACTOR_NAME
+            )
     table = parse_section(section, zone_code, str(file_path))
     return ExtractionOutcome(status="extracted", table=table, extractor=EXTRACTOR_NAME)

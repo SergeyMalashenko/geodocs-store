@@ -797,6 +797,17 @@ def test_query_documents_log_records_negative_outcomes(
 # static fast-path: extractions раньше LLM
 # ---------------------------------------------------------------------------
 
+
+def test_zone_code_re_multisegment() -> None:
+    """«КРТ-3-63» извлекается целиком, а не обрезается до «КРТ-3»."""
+    from geodocs.agent.query import _ZONE_CODE_RE
+
+    text = "Верни ВРИ территориальных зон КРТ-3-63 и Ж-2 из указанных документов ПЗЗ"
+    assert sorted({code.upper() for code in _ZONE_CODE_RE.findall(text.upper())}) == [
+        "Ж-2",
+        "КРТ-3-63",
+    ]
+
 _VRI_TABLE_PAYLOAD = {
     "zone_code": "Ж-1",
     "zone_name": "Зона жилой застройки",

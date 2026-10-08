@@ -502,3 +502,90 @@ def test_vri_item_accepts_numeric_building_percentage():
 
     item = VriItem(row="3", code="2.1", building_percentage=3, raw="3 | 2.1 | 3")
     assert item.building_percentage == 3
+
+
+# ---------------------------------------------------------------------------
+# КРТ-layout: голый код зоны без «ЗОНА», таблица параметров, список ВРИ
+# (ПЗЗ Рузского муниципального округа, стр. 316+).
+# ---------------------------------------------------------------------------
+
+KRT_LAYOUT_FIXTURE = """\
+     Статья 41. Градостроительные регламенты для зон КРТ
+
+                                       КРТ-3-62
+     Требования к архитектурно-градостроительному облику распространяются на
+объекты капитального строительства.
+№     Наименование параметра                         Значение параметра
+                                      Не более 40% (для вида разрешенного
+     Процент застройки земельного
+1                                    использования земельных участков
+                участка
+                                      «для индивидуального жилищного строительства»)
+2 Предельно допустимая этажность                       Не более 3 этажей
+                            Виды разрешенного использования
+       ТИП                                           ВРИ
+                   2.1 Для индивидуального жилищного строительства
+                   2.7.1 Хранение автотранспорта
+    Основные:      3.3 Бытовое обслуживание
+                   3.4.1 Амбулаторно-поликлиническое обслуживание
+   Условно-       4.2 Объекты торговли (торговые центры
+ разрешенные:     (комплексы)
+                                         320
+                                       КРТ-3-63
+     Требования к архитектурно-градостроительному облику распространяются на
+объекты капитального строительства.
+                            Виды разрешенного использования
+       ТИП                                           ВРИ
+                   2.1 Для индивидуального жилищного строительства
+Вспомогательные: 6.8 Связь
+                                         321
+                                       КРТ-3-74
+     Требования к архитектурно-градостроительному облику распространяются на
+объекты капитального строительства.
+"""
+
+
+def test_pdf_layout_krt_section_locator() -> None:
+    span = pdf_layout.locate_section(KRT_LAYOUT_FIXTURE, "КРТ-3-63")
+    assert span is not None
+    section = KRT_LAYOUT_FIXTURE[span[0] : span[1]].strip()
+    assert section.startswith("КРТ-3-63")
+    assert "КРТ-3-74" not in section
+    assert pdf_layout.locate_section(KRT_LAYOUT_FIXTURE, "КРТ-9-99") is None
+
+
+def test_pdf_layout_krt_synthetic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pdf_layout, "run_pdftotext", lambda path: KRT_LAYOUT_FIXTURE)
+    path = tmp_path / "reglament.pdf"
+
+    outcome = extract_vri_from_file(path, filename="reglament.pdf", zone_code="КРТ-3-63")
+
+    assert outcome.status == "extracted"
+    assert outcome.extractor == "vri-pdf-layout-krt@1"
+    table = outcome.table
+    assert table is not None
+    assert table.zone_code == "КРТ-3-63"
+    assert [item.code for item in table.items] == ["2.1", "6.8"]
+    assert table.items[0].name == "Для индивидуального жилищного строительства"
+    assert table.items[1].name == "Связь"
+
+
+def test_pdf_layout_krt_zone_params_attached_to_qualified_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pdf_layout, "run_pdftotext", lambda path: KRT_LAYOUT_FIXTURE)
+    path = tmp_path / "reglament.pdf"
+
+    outcome = extract_vri_from_file(path, filename="reglament.pdf", zone_code="КРТ-3-62")
+
+    assert outcome.status == "extracted"
+    table = outcome.table
+    assert table is not None
+    codes = [item.code for item in table.items]
+    # маркеры типов вырезаны, перенос «(комплексы)» склеен с наименованием
+    assert codes == ["2.1", "2.7.1", "3.3", "3.4.1", "4.2"]
+    assert table.items[-1].name == "Объекты торговли (торговые центры (комплексы)"
+    first = table.items[0]
+    assert first.building_percentage == "3 эт. – 40%"

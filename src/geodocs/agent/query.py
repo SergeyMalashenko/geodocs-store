@@ -42,7 +42,7 @@ from .config import AgentTierConfig
 
 RESULT_MARKER = "=== RESULT ==="
 _UNKNOWN_VERSION_DATE = "unknown"  # как в store.py: редакция без даты
-_ZONE_CODE_RE = re.compile(r"[А-ЯЁA-Z]{1,4}-\d{1,2}")  # как в agent/mcp.py
+_ZONE_CODE_RE = re.compile(r"[А-ЯЁA-Z]{1,4}(?:-\d+)+")  # как в agent/mcp.py
 _ZOUIT_QUERY_RE = re.compile(r"зоуит|режим|ограничен", re.IGNORECASE)
 
 _TERMINAL_STATUSES = (
