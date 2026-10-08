@@ -35,7 +35,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..extractors import VriExtractor, VriTable
-from ..models import DocType, DocumentRef, ExtractionKind
+from ..models import DocType, DocumentRef, ExtractionKind, FetchStatus
 from ..store import DocumentStore
 from .ask import _ask_executor
 from .config import AgentTierConfig
@@ -285,6 +285,48 @@ def _vri_quote(table: VriTable) -> str | None:
     return None
 
 
+def _expand_pzz_versions(
+    store: DocumentStore, pzz: list[ResolvedDocument]
+) -> list[ResolvedDocument]:
+    """Все скачанные версии ПЗЗ того же муниципалитета.
+
+    Sync контура привязывает версию из карточки РГИС — часто это поправка
+    без полной таблицы ВРИ, а базовая редакция того же муниципалитета уже
+    лежит в базе под другим номером. Резолвнутые версии идут первыми,
+    дальше — по убыванию даты редакции, редакции без даты — в конец.
+    """
+    seen = {doc.version_id for doc in pzz}
+    extras: list[ResolvedDocument] = []
+    for municipality in sorted({doc.municipality for doc in pzz}):
+        rows = store.connection.execute(
+            "SELECT v.id, d.municipality, d.doc_type, d.number, v.version_date,"
+            " COALESCE(v.title, d.title) AS title"
+            " FROM document_versions v JOIN documents d ON d.id = v.document_id"
+            " WHERE d.municipality = ? AND d.doc_type = ? AND v.fetch_status = ?",
+            (municipality, DocType.PZZ.value, FetchStatus.DOWNLOADED.value),
+        ).fetchall()
+        for row in rows:
+            record = dict(zip(row.keys(), row, strict=True))
+            if record["id"] in seen:
+                continue
+            seen.add(record["id"])
+            extras.append(
+                ResolvedDocument(
+                    version_id=record["id"],
+                    municipality=record["municipality"],
+                    doc_type=record["doc_type"],
+                    number=record["number"],
+                    version_date=record["version_date"],
+                    title=record["title"],
+                )
+            )
+    extras.sort(
+        key=lambda doc: (doc.version_date != _UNKNOWN_VERSION_DATE, doc.version_date),
+        reverse=True,
+    )
+    return [*pzz, *extras]
+
+
 def _static_vri(
     store: DocumentStore,
     documents: list[ResolvedDocument],
@@ -292,9 +334,11 @@ def _static_vri(
     warnings: list[str],
 ) -> QueryResult | None:
     """ВРИ по кодам зон: VriExtractor по версиям ПЗЗ (кэширует в extractions)."""
+    others = [doc for doc in documents if doc.doc_type != DocType.PZZ.value]
     pzz = [doc for doc in documents if doc.doc_type == DocType.PZZ.value]
     if not zones or not pzz:
         return None
+    pzz = _expand_pzz_versions(store, pzz)
     extractor = VriExtractor(store)
     data_zones: dict[str, dict[str, Any]] = {
         zone: {"zone_code": zone, "found": False, "extractions": []} for zone in zones
@@ -339,7 +383,7 @@ def _static_vri(
             f"Таблицы ВРИ извлечены детерминированно: зоны с данными —"
             f" {found} из {len(zones)}"
         ),
-        documents=documents,
+        documents=[*others, *pzz],
         executor="static:vri",
     )
 

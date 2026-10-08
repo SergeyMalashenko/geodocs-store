@@ -863,6 +863,47 @@ def test_query_static_vri_partial(
     assert found == {"Ж-1": True, "ТЦ-2": False}
 
 
+def test_query_static_vri_sibling_version_same_municipality(
+    home: Path, store: DocumentStore, seeded: int, tmp_path: Path, stub_type: None
+) -> None:
+    """Зона находится в базовой редакции ПЗЗ того же муниципалитета.
+
+    Sync привязал поправку (seeded, битый кэш таблицы), а полная таблица
+    лежит в другой версии того же муниципалитета под другим номером —
+    static:vri обязан попробовать и её, не дожидаясь LLM.
+    """
+    base_id = store.register_ref(
+        _ref("100", "2020-01-01", role=DocRole.BASE, amendment_number=None)
+    )
+    base_file = tmp_path / "2020-01-01_база.txt"
+    base_file.write_text(_TXT_CONTENT, encoding="utf-8")
+    store.record_agent_fetch(
+        base_id,
+        files=[
+            FileRecord(
+                path=str(base_file),
+                size=base_file.stat().st_size,
+                sha256=hashlib.sha256(base_file.read_bytes()).hexdigest(),
+                title=base_file.name,
+            )
+        ],
+        source_url="https://solreg.ru/docs/100",
+        fetched_at="2026-10-08T00:00:00+00:00",
+    )
+    _seed_vri_table(store, base_id)
+    _STUB_BEHAVIORS["hermes"] = _fail_behavior
+    result = query_documents(
+        [seeded], "Верни ВРИ зоны Ж-1", home=home, config=_stub_config()
+    )
+    assert result.status is QueryStatus.SUCCESS
+    assert result.executor == "static:vri"
+    (zone,) = result.data["zones"]
+    assert zone["found"] is True
+    assert zone["extractions"][0]["version_id"] == base_id
+    assert result.evidence[0].version_id == base_id
+    assert any("static:vri" in warning for warning in result.warnings)
+
+
 def test_query_static_miss_goes_to_llm(
     home: Path, seeded: int, stub_type: None
 ) -> None:
