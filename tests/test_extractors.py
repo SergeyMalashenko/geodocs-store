@@ -190,7 +190,7 @@ def test_extract_docx_synthetic(tmp_path: Path) -> None:
     outcome = extract_vri_from_file(path, filename="reglament.docx", zone_code="Ж-2")
 
     assert outcome.status == "extracted"
-    assert outcome.extractor == "vri-docx@1"
+    assert outcome.extractor == "vri-docx@2"
     table = outcome.table
     assert table is not None
     assert table.zone_code == "Ж-2"
@@ -405,7 +405,7 @@ def test_vri_extractor_end_to_end(store: DocumentStore, tmp_path: Path) -> None:
         version_id, zone_code="Ж-2", kind=ExtractionKind.VRI_TABLE
     )
     assert record is not None
-    assert record.extractor == "vri-docx@1"
+    assert record.extractor == "vri-docx@2"
     assert record.confidence == 1.0
     assert record.payload["counts"] == {"rows_total": 2, "rows_parsed": 2}
     assert record.payload["items"][0]["code"] == "2.1*"
@@ -589,3 +589,78 @@ def test_pdf_layout_krt_zone_params_attached_to_qualified_item(
     assert table.items[-1].name == "Объекты торговли (торговые центры (комплексы)"
     first = table.items[0]
     assert first.building_percentage == "3 эт. – 40%"
+
+
+# ---------------------------------------------------------------------------
+# DOCX v2: угловая пустая ячейка сетки и многозональный документ
+# ---------------------------------------------------------------------------
+
+_DOCX_CORNER_MULTIZONE_XML = """\
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p><w:r><w:t>Ж-2 - ЗОНА ЗАСТРОЙКИ ИНДИВИДУАЛЬНЫМИ ЖИЛЫМИ ДОМАМИ</w:t></w:r></w:p>
+<w:tbl>
+<w:tr><w:tc><w:p><w:r><w:t></w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>№п/п</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>Наименование ВРИ</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>Код</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>min</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>max</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>%</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>отступ</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t></w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>Для индивидуального жилищного строительства</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>2.1*</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>500</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>5 000 000</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>40%</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>3</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t></w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>2</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>Хранение автотранспорта</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>2.7.1</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>30 (15****)</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>20 000 (50****)</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>75% (100%****)</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>3 (0****)</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>
+<w:p><w:r><w:t>Ж-3 - ЗОНА МНОГОКВАРТИРНОЙ ЖИЛОЙ ЗАСТРОЙКИ</w:t></w:r></w:p>
+<w:tbl>
+<w:tr><w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>Среднеэтажная жилая застройка</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>2.5</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>10000</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>1000000</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>35%</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>5</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>
+</w:body>
+</w:document>
+"""
+
+
+def test_extract_docx_corner_cell_and_multizone_scoping(tmp_path: Path) -> None:
+    path = _write_docx(tmp_path / "reglament.docx", xml=_DOCX_CORNER_MULTIZONE_XML)
+
+    outcome = extract_vri_from_file(path, filename="reglament.docx", zone_code="Ж-2")
+
+    assert outcome.status == "extracted"
+    assert outcome.extractor == "vri-docx@2"
+    table = outcome.table
+    assert table is not None
+    # только секция Ж-2: строка из таблицы Ж-3 не попадает
+    assert [item.code for item in table.items] == ["2.1*", "2.7.1"]
+    second = table.items[1]
+    # варианты в скобках — по ведущему числу и по позиции колонки
+    assert second.area_min == 30
+    assert second.area_max == 20000
+    assert second.building_percentage == "75% (100%****)"
+    assert second.margin == 3
+
+    first = table.items[0]
+    # угловая пустая ячейка не смещает колонки: имя — не номер строки
+    assert first.name == "Для индивидуального жилищного строительства"
+    assert first.area_min == 500
+    assert first.margin == 3
