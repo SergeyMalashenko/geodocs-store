@@ -46,6 +46,14 @@ _PACKAGE_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 # Шаблон промта: «СКАЧИВАНИЕ: каталог {inbox_dir} (mkdir -p)» — inbox задачи.
 _INBOX_PROMPT_RE = re.compile(r"каталог (\S+)")
 _HERMES_HOME_ENV = "HERMES_HOME"
+# Веб-инструменты Hermes (web_search/web_extract — бэкенд Firecrawl по ключу
+# из .env) — последнее звено динамического поиска; промт на них рассчитан,
+# поэтому харнесс включает их независимо от настроек основного профиля
+# (browser намеренно не трогаем: тяжёлый и для поиска не нужен). Включать
+# приходится в двух местах: agent.disabled_toolsets (вычитание toolset'ов)
+# и platform_toolsets.cli (явный список платформы замещает дефолт hermes-cli —
+# если там перечислены только file/terminal, web-инструментов нет вовсе).
+_WEB_TOOLSETS = frozenset({"web", "search"})
 
 
 class QuotaExceeded(RuntimeError):
@@ -264,6 +272,35 @@ class HermesExecutor(SubprocessExecutor):
             },
         }
         config["mcp_servers"] = servers
+        agent_cfg = config.get("agent")
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        disabled = agent_cfg.get("disabled_toolsets")
+        if isinstance(disabled, list):
+            agent_cfg["disabled_toolsets"] = [
+                name for name in disabled if name not in _WEB_TOOLSETS
+            ]
+        config["agent"] = agent_cfg
+        # Прогрессивное раскрытие инструментов (tool_search/tool_call-мост)
+        # выключаем: в харнессе всего 3 MCP-инструмента + штатные веб —
+        # схемы дёшевы, а маленькие модели через мост зацикливаются
+        # (tool_call без name) или не находят web_search/web_extract.
+        tools_cfg = config.get("tools")
+        if not isinstance(tools_cfg, dict):
+            tools_cfg = {}
+        tool_search_cfg = tools_cfg.get("tool_search")
+        if not isinstance(tool_search_cfg, dict):
+            tool_search_cfg = {}
+        tool_search_cfg["enabled"] = "off"
+        tools_cfg["tool_search"] = tool_search_cfg
+        config["tools"] = tools_cfg
+        # Явный platform_toolsets.cli замещает дефолт hermes-cli: если в нём
+        # только file/terminal, web-инструменты не регистрируются вовсе.
+        platform_toolsets = config.get("platform_toolsets")
+        if isinstance(platform_toolsets, dict):
+            cli_toolsets = platform_toolsets.get("cli")
+            if isinstance(cli_toolsets, list) and "web" not in cli_toolsets:
+                platform_toolsets["cli"] = [*cli_toolsets, "web"]
         (home / "config.yaml").write_text(
             yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
         )

@@ -37,6 +37,7 @@ from geodocs.agent.mcp import (
     _fetch_page,
     _search_portals,
     find_document_impl,
+    import_document_impl,
 )
 from geodocs.agent.portals import (
     Candidate,
@@ -294,6 +295,48 @@ async def test_cntd_fetch_fails_when_no_blocks(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio()
+async def test_import_document_accepts_cntd_fulltext_html(tmp_path: Path) -> None:
+    """Полный текст cntd — HTML-рендер адаптера, а не произвольная страница:
+    гейт сигнатур его не режет (та же сущность, что статический ярус
+    сохраняет через save_file)."""
+    home = tmp_path / "home"
+    ctx = McpContext(inbox=tmp_path / "inbox", home=home)
+    base = "https://docs.cntd.ru/api/document/408453215"
+    with respx.mock:
+        respx.get(f"{base}/content/text/blocks/size").mock(
+            return_value=httpx.Response(
+                200, json={"data": {"content": [{"block_index": 1}]}}
+            )
+        )
+        respx.get(f"{base}/content/text/block/1").mock(
+            return_value=httpx.Response(
+                200, text="<div>Постановление № 1986/8</div>"
+            )
+        )
+        result = await import_document_impl(
+            ctx,
+            "https://docs.cntd.ru/document/408453215",
+            portal="cntd",
+            doc_hint={
+                "municipality": "Городской округ Красногорск",
+                "doc_type": "pzz",
+                "number": "1986/8",
+                "version_date": "2026-08-06",
+            },
+        )
+    assert result.get("fetch_status") == "downloaded", result
+    store = DocumentStore(home / "geodocs.sqlite3", files_dir=home / "files")
+    try:
+        (record,) = store.files_for_version(result["version_id"])
+        assert record.file_path.endswith("cntd_408453215.html")
+        assert "Постановление № 1986/8" in Path(record.file_path).read_text(
+            encoding="utf-8"
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio()
 async def test_fgistp_search_is_byo_url_and_fetch_parses_card(tmp_path: Path) -> None:
     adapter = get_portal("fgistp")
     assert await adapter.search(KOLOMNA_QUERY) == []
@@ -491,6 +534,29 @@ async def test_mcp_download_direct_refuses_html(tmp_path: Path) -> None:
         )
         with pytest.raises(PortalError, match="HTML-страницу"):
             await _download_to_inbox(ctx2, "https://shatura-adm.ru/page")
+
+
+@pytest.mark.asyncio()
+async def test_mcp_download_unknown_portal_falls_back_to_direct(
+    tmp_path: Path,
+) -> None:
+    """Модель иногда подставляет домен вместо тега портала — прямое скачивание."""
+    ctx = McpContext(inbox=tmp_path / "inbox", home=tmp_path)
+    with respx.mock:
+        respx.get("https://krasnogorsk-adm.ru/files/gen_plan.pdf").mock(
+            return_value=httpx.Response(
+                200,
+                content=_PDF_BYTES,
+                headers={"content-type": "application/pdf"},
+            )
+        )
+        result = await _download_to_inbox(
+            ctx,
+            "https://krasnogorsk-adm.ru/files/gen_plan.pdf",
+            portal="krasnogorsk-adm.ru",
+        )
+    assert result["size"] == len(_PDF_BYTES)
+    assert Path(result["path"]).exists()
 
 
 @pytest.mark.asyncio()
@@ -850,6 +916,15 @@ def test_prompt_orders_tools_before_web_search() -> None:
     assert order == sorted(order), "инструменты должны идти раньше веб-поиска"
     assert "=== MANIFEST ===" in prompt
     assert prompt.rstrip().endswith("}")
+
+
+def test_prompt_names_web_tools_explicitly() -> None:
+    """Маленькие модели не находят веб-инструменты по описанию — промт
+    называет их по имени и подсказывает tool_search."""
+    prompt = build_prompt(_task(), "/tmp/inbox/pzz_1069")
+    assert "web_search" in prompt
+    assert "web_extract" in prompt
+    assert 'tool_search("web_search")' in prompt
 
 
 # ---------------------------------------------------------------------------

@@ -379,6 +379,19 @@ def test_parse_manifest_indented_marker() -> None:
     assert parse_manifest(stdout) == {"status": "not_found", "files": [], "notes": "нет"}
 
 
+def test_parse_manifest_fenced_block() -> None:
+    """Модели оборачивают манифест в markdown-fence — ограждение снимается."""
+    body = json.dumps(_GOOD_MANIFEST, ensure_ascii=False)
+    stdout = "отчёт\n```json\n" + MANIFEST_MARKER + "\n" + body + "\n```\n"
+    assert parse_manifest(stdout) == _GOOD_MANIFEST
+
+
+def test_parse_manifest_trailing_fence_after_inline_json() -> None:
+    body = json.dumps(_GOOD_MANIFEST, ensure_ascii=False)
+    stdout = "```json\n" + MANIFEST_MARKER + " " + body + "\n```\n"
+    assert parse_manifest(stdout) == _GOOD_MANIFEST
+
+
 # ---------------------------------------------------------------------------
 # verify_files / gate_pass
 # ---------------------------------------------------------------------------
@@ -697,6 +710,43 @@ def test_run_task_gate_failed_keeps_db(
     assert version is not None
     assert version.fetch_status is FetchStatus.NOT_FOUND
     assert store.files_for_version(task.version_id) == []
+
+
+def test_run_task_store_downloaded_wins_over_manifest_gate(
+    store: DocumentStore, seeded: dict[str, int], tmp_path: Path
+) -> None:
+    """import_document зарегистрировал версию в ходе сессии (полный текст cntd —
+    HTML, гейт сигнатур его не пропускает): база — источник истины, итог
+    downloaded, статус версии не откатывается."""
+    task = list_pending_tasks(store, statuses=("not_found",))[0]
+    home = store.db_path.parent
+    script = _fake_agent(
+        tmp_path,
+        home / "inbox" / task.slug,
+        {"cntd_408453215.html": "<html>полный текст</html>".encode()},
+        {"status": "found", "source_url": "https://docs.cntd.ru/document/408453215"},
+    )
+    # имитация import_document в середине сессии: версия уже downloaded
+    store.set_fetch_status(task.version_id, FetchStatus.DOWNLOADED)
+
+    result = run_task(
+        task,
+        store,
+        executors=[_script_executor(script)],
+        config=_SINGLE_PASS,
+        geodocs_home=home,
+    )
+
+    assert result.status == "downloaded"
+    assert result.verdicts == []  # inbox-гейт не запускался
+    version = store.find_version(
+        municipality=MUNICIPALITY,
+        doc_type=DocType.PZZ,
+        number="944",
+        version_date=AMENDMENT_DATE,
+    )
+    assert version is not None
+    assert version.fetch_status is FetchStatus.DOWNLOADED
 
 
 def test_run_task_agent_error_no_manifest(

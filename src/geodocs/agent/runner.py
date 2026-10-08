@@ -93,6 +93,17 @@ def _tail(text: str | bytes | None) -> str | None:
     return text[-_TAIL_LEN:]
 
 
+def _strip_code_fence(text: str) -> str:
+    """Снимает markdown-ограждение ```...``` — модели часто так оформляют
+    манифест, и ограждение ломало json.loads."""
+    fence_lines = text.splitlines()
+    while fence_lines and fence_lines[0].strip().startswith("```"):
+        fence_lines.pop(0)
+    while fence_lines and fence_lines[-1].strip().startswith("```"):
+        fence_lines.pop()
+    return "\n".join(fence_lines).strip()
+
+
 def parse_manifest(stdout: str) -> dict[str, Any] | None:
     """Извлекает JSON-манифест из stdout агента.
 
@@ -111,6 +122,7 @@ def parse_manifest(stdout: str) -> dict[str, Any] | None:
             "\n".join(lines[index + 1 :]).strip(),
         )
         for candidate in candidates:
+            candidate = _strip_code_fence(candidate)
             if not candidate:
                 continue
             try:
@@ -223,6 +235,20 @@ def _failed_reasons(verdicts: list[FileVerdict]) -> str:
     return "; ".join(failed)
 
 
+def _version_downloaded(store: DocumentStore, task: AgentTask) -> bool:
+    """Версия уже downloaded в базе (import_document отработал в ходе сессии).
+
+    База — источник истины: ни потерянный манифест, ни inbox-гейт её не
+    отменяют (полный текст cntd — HTML, который гейт сигнатур не пропускает,
+    но это легитимное содержимое документа).
+    """
+    row = store.connection.execute(
+        "SELECT fetch_status FROM document_versions WHERE id = ?",
+        (task.version_id,),
+    ).fetchone()
+    return bool(row) and row["fetch_status"] == "downloaded"
+
+
 def _manifest_source_url(manifest: dict[str, Any]) -> str | None:
     url = manifest.get("source_url")
     return url if isinstance(url, str) and url else None
@@ -283,13 +309,20 @@ def _attempt_with_executor(
         exec_result = executor.run(prompt, home)
     except ExecutionTimeout as exc:
         error = str(exc)
-        # агент убит по таймауту, но мог успеть скачать валидные файлы
-        verdicts, copied = _collect_files(
-            _inbox_document_names(inbox), inbox, store, task
-        )
-        if _gate_and_register(verdicts, copied, store, task, None, executor.provider):
+        if _version_downloaded(store, task):
+            # import_document успел зарегистрировать версию до убийства агента
             status = "downloaded"
-            error += "; recovered from inbox evidence after timeout"
+            error += "; версия зарегистрирована import_document до таймаута"
+        else:
+            # агент убит по таймауту, но мог успеть скачать валидные файлы
+            verdicts, copied = _collect_files(
+                _inbox_document_names(inbox), inbox, store, task
+            )
+            if _gate_and_register(
+                verdicts, copied, store, task, None, executor.provider
+            ):
+                status = "downloaded"
+                error += "; recovered from inbox evidence after timeout"
     except ExecutorError as exc:
         error = str(exc)
     else:
@@ -303,7 +336,12 @@ def _attempt_with_executor(
             )
         else:
             manifest = parse_manifest(exec_result.stdout)
-            if manifest is None:
+            if _version_downloaded(store, task):
+                # import_document зарегистрировал версию в ходе сессии —
+                # исход уже зафиксирован в базе, манифест/inbox-гейт его
+                # не переопределяют
+                status = "downloaded"
+            elif manifest is None:
                 # манифест потерян (типично: квота убила агента после
                 # скачивания) — принимаем по уликам из inbox
                 verdicts, copied = _collect_files(

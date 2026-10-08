@@ -132,14 +132,27 @@ async def _download_to_inbox(
     portal: str | None = None,
     file_name: str | None = None,
 ) -> dict[str, Any]:
-    """Скачивает файл по URL в inbox; с portal-адаптером или напрямую."""
+    """Скачивает файл по URL в inbox; с portal-адаптером или напрямую.
+
+    Неизвестный тег портала (модель иногда подставляет домен вместо тега из
+    кандидата) — не падение, а прямое скачивание: намерение агента очевидно.
+    """
     ctx.inbox.mkdir(parents=True, exist_ok=True)
     if portal:
-        adapter = get_portal(portal)
-        candidate = Candidate(url=url, title=file_name or url, portal=portal)
-        path = await adapter.fetch(candidate, ctx.inbox)
-        size = path.stat().st_size
-        return {"path": str(path), "size": size, "content_type": None, "portal": portal}
+        try:
+            adapter = get_portal(portal)
+        except KeyError:
+            adapter = None
+        else:
+            candidate = Candidate(url=url, title=file_name or url, portal=portal)
+            path = await adapter.fetch(candidate, ctx.inbox)
+            size = path.stat().st_size
+            return {
+                "path": str(path),
+                "size": size,
+                "content_type": None,
+                "portal": portal,
+            }
 
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
         try:
@@ -492,7 +505,13 @@ async def import_document_impl(
             shutil.copy2(path, destination)
             copied.append(destination)
         verdicts = verify_files(copied)
-        if not gate_pass(verdicts):
+        # Полный текст cntd — HTML-рендер адаптера (не произвольная страница):
+        # та же сущность, что статический ярус сохраняет через save_file,
+        # поэтому гейт сигнатур/размеров к ней не применяется.
+        is_cntd_text = portal == "cntd" and all(
+            path.suffix.casefold() == ".html" for path in copied
+        )
+        if not is_cntd_text and not gate_pass(verdicts):
             reasons = "; ".join(
                 f"{Path(v.path).name}: {v.reason}" for v in verdicts if not v.ok
             )

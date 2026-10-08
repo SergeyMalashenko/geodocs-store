@@ -494,6 +494,60 @@ def test_hermes_executor_invokes_subprocess(
     assert result.duration_seconds >= 0
 
 
+def test_hermes_executor_enables_web_toolset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Харнесс снимает web/search из disabled_toolsets профиля: промт рассчитан
+    на штатные веб-инструменты (Firecrawl), а основной профиль может их
+    выключать. Тяжёлый browser при этом остаётся выключенным."""
+    profile = tmp_path / "hermes-src"
+    (profile / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "agent": {
+                    "disabled_toolsets": ["web", "search", "browser", "todo"]
+                },
+                "platform_toolsets": {"cli": ["file", "terminal"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "geodocs.agent.executors.subprocess.run",
+        lambda *a, **k: _completed(stdout="ok"),
+    )
+    HermesExecutor(_hermes_cfg()).run("промт", tmp_path)
+    config = yaml.safe_load(
+        (tmp_path / ".hermes-home" / "inbox" / "config.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    disabled = config["agent"]["disabled_toolsets"]
+    assert "web" not in disabled and "search" not in disabled
+    assert "browser" in disabled and "todo" in disabled
+    # явный platform_toolsets.cli замещает дефолт — web надо дописать туда
+    assert "web" in config["platform_toolsets"]["cli"]
+    assert "file" in config["platform_toolsets"]["cli"]
+
+
+def test_hermes_executor_disables_tool_search_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tool_search-мост выключен: 3 MCP-инструмента + веб видны модели напрямую,
+    иначе маленькие модели зацикливаются на кривых вызовах tool_call."""
+    monkeypatch.setattr(
+        "geodocs.agent.executors.subprocess.run",
+        lambda *a, **k: _completed(stdout="ok"),
+    )
+    HermesExecutor(_hermes_cfg()).run("промт", tmp_path)
+    config = yaml.safe_load(
+        (tmp_path / ".hermes-home" / "inbox" / "config.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert config["tools"]["tool_search"]["enabled"] == "off"
+
+
 def test_executor_quota_raises_on_failure_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
