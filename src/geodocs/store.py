@@ -7,7 +7,7 @@ import json
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +112,23 @@ CREATE TABLE IF NOT EXISTS query_log (
     warnings_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS search_observations (
+    id INTEGER PRIMARY KEY,
+    query TEXT NOT NULL,
+    url TEXT,
+    result TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS answer_cache (
+    cache_key TEXT PRIMARY KEY,
+    content_hashes TEXT NOT NULL,
+    query_norm TEXT NOT NULL,
+    schema_hash TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 _TABLES = (
@@ -122,6 +139,8 @@ _TABLES = (
     "parcel_documents",
     "extractions",
     "query_log",
+    "search_observations",
+    "answer_cache",
 )
 
 _CHUNK_SIZE = 1024 * 1024
@@ -553,11 +572,35 @@ class DocumentStore:
         означает, что URL неизвестен: прежний source_url версии сохраняется,
         запись provenance не добавляется (source_object_id обязателен в схеме).
         Повторный вызов с теми же файлами идемпотентен.
+
+        Дедупликация по содержимому — как в `save_file`: sha256 глобально
+        уникален (владелец — версия, сохранившая файл первой); если хэш уже
+        принадлежит другой версии, запись создаётся с sha256=NULL, а не
+        падает с UNIQUE-ошибкой.
         """
         if not files:
             raise ValueError("files не должен быть пустым")
         provider = SourceName(source_provider)
         primary = _primary_agent_file(files)
+
+        def _owned_sha256(sha256: str | None, *, owner_version: int) -> str | None:
+            """Хэш, если он свободен или уже принадлежит этой версии; иначе NULL."""
+            if sha256 is None:
+                return None
+            row = self.connection.execute(
+                "SELECT version_id FROM version_files"
+                " WHERE sha256 = ? AND version_id != ? LIMIT 1",
+                (sha256, owner_version),
+            ).fetchone()
+            if row is not None:
+                return None
+            row = self.connection.execute(
+                "SELECT id FROM document_versions"
+                " WHERE sha256 = ? AND id != ? LIMIT 1",
+                (sha256, owner_version),
+            ).fetchone()
+            return None if row is not None else sha256
+
         with self.connection:
             self.connection.execute(
                 "UPDATE document_versions SET file_path = ?, sha256 = ?,"
@@ -566,7 +609,7 @@ class DocumentStore:
                 " fetched_at = ? WHERE id = ?",
                 (
                     primary.path,
-                    primary.sha256,
+                    _owned_sha256(primary.sha256, owner_version=version_id),
                     source_url,
                     provider.value,
                     FetchStatus.DOWNLOADED.value,
@@ -583,13 +626,14 @@ class DocumentStore:
                     "INSERT INTO version_files"
                     " (version_id, title, section, file_path, sha256, size_bytes,"
                     "  created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT (version_id, sha256) DO NOTHING",
                     (
                         version_id,
                         record.title,
                         record.section or _agent_file_section(name),
                         record.path,
-                        record.sha256,
+                        _owned_sha256(record.sha256, owner_version=version_id),
                         record.size,
                         _utcnow(),
                     ),
@@ -708,6 +752,93 @@ class DocumentStore:
             "SELECT * FROM query_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [_to_query_log(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # SearchObservation (§53 ТЗ): negative/search cache discovery
+    # ------------------------------------------------------------------
+
+    def record_observation(
+        self,
+        query: str,
+        url: str | None,
+        result: str,
+        detail: str | None = None,
+    ) -> int:
+        """Фиксирует наблюдение поиска: URL/цель и исход её исследования.
+
+        result: candidate | irrelevant | blocked | not_found | mismatch.
+        Цель — не исследовать один и тот же бесполезный URL при каждом
+        новом acquisition.
+        """
+        with self.connection:
+            cursor = self.connection.execute(
+                "INSERT INTO search_observations (query, url, result, detail, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (query, url, result, detail, _utcnow()),
+            )
+        return int(cursor.lastrowid)
+
+    def negative_observations(
+        self, query: str, *, since_days: int
+    ) -> list[dict[str, Any]]:
+        """Негативные наблюдения по цели за окно `since_days` (новые первыми).
+
+        Негативные — not_found, mismatch, blocked: повод не повторять поиск.
+        """
+        since = (
+            datetime.now(timezone.utc) - timedelta(days=since_days)
+        ).isoformat()
+        rows = self.connection.execute(
+            "SELECT * FROM search_observations"
+            " WHERE query = ? AND result IN ('not_found', 'mismatch', 'blocked')"
+            " AND created_at >= ? ORDER BY id DESC",
+            (query, since),
+        ).fetchall()
+        return [_row_dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Answer cache (§58 ТЗ): кэш structured extraction
+    # ------------------------------------------------------------------
+
+    def get_cached_answer(self, cache_key: str) -> dict[str, Any] | None:
+        """Кэшированный результат query_documents по ключу; None — промах."""
+        row = self.connection.execute(
+            "SELECT result_json FROM answer_cache WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["result_json"])  # type: ignore[no-any-return]
+
+    def save_answer(
+        self,
+        cache_key: str,
+        *,
+        content_hashes: list[str],
+        query_norm: str,
+        schema_hash: str,
+        pipeline_version: str,
+        result: dict[str, Any],
+    ) -> None:
+        """Идемпотентно сохраняет результат запроса в кэш (replace по ключу)."""
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO answer_cache"
+                " (cache_key, content_hashes, query_norm, schema_hash,"
+                "  pipeline_version, result_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (cache_key) DO UPDATE SET"
+                " result_json = excluded.result_json,"
+                " created_at = excluded.created_at",
+                (
+                    cache_key,
+                    json.dumps(sorted(content_hashes)),
+                    query_norm,
+                    schema_hash,
+                    pipeline_version,
+                    json.dumps(result, ensure_ascii=False),
+                    _utcnow(),
+                ),
+            )
 
     def get_document(self, document_id: int) -> DocumentRecord | None:
         """Документ по id."""

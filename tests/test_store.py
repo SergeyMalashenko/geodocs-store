@@ -365,6 +365,8 @@ def test_stats(store: DocumentStore) -> None:
         "parcel_documents": 0,
         "extractions": 0,
         "query_log": 0,
+        "search_observations": 0,
+        "answer_cache": 0,
     }
     version_id = store.register_ref(_base_ref())
     store.link_parcel(CN_1, version_id)
@@ -384,6 +386,8 @@ def test_stats(store: DocumentStore) -> None:
         "parcel_documents": 1,
         "extractions": 1,
         "query_log": 0,
+        "search_observations": 0,
+        "answer_cache": 0,
     }
 
 

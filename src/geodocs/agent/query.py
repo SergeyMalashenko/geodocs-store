@@ -23,6 +23,7 @@ response_schema, отклоняется с warning — запрос уходит
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -193,6 +194,54 @@ def _persist_query(home_path: Path, query: str, result: QueryResult) -> None:
             store.close()
     except Exception as exc:  # noqa: BLE001 — аудит не должен ронять ответ
         result.warnings.append(f"query_log не записан: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Кэш ответов (§58 ТЗ): structured extraction cache
+# ---------------------------------------------------------------------------
+
+_CACHE_PIPELINE = "query:v1"  # версия extraction pipeline — часть ключа кэша
+
+
+def _content_hashes(store: DocumentStore, resolved: list[ResolvedDocument]) -> list[str]:
+    """sha256 содержимого версий (первичный файл); без файла — version_id."""
+    hashes: list[str] = []
+    for doc in resolved:
+        row = store.connection.execute(
+            "SELECT sha256 FROM document_versions WHERE id = ?", (doc.version_id,)
+        ).fetchone()
+        digest = row["sha256"] if row is not None else None
+        if digest is None:
+            row = store.connection.execute(
+                "SELECT sha256 FROM version_files"
+                " WHERE version_id = ? AND sha256 IS NOT NULL LIMIT 1",
+                (doc.version_id,),
+            ).fetchone()
+            digest = row["sha256"] if row is not None else None
+        hashes.append(digest or f"version:{doc.version_id}")
+    return sorted(hashes)
+
+
+def _cache_key(
+    content_hashes: list[str],
+    query: str,
+    response_schema: dict[str, Any] | None,
+    executor_name: str,
+) -> tuple[str, str, str, str]:
+    """Ключ кэша: sha256(content | нормализованный запрос | схема | pipeline)."""
+    query_norm = " ".join(query.casefold().split())
+    schema_json = (
+        json.dumps(response_schema, ensure_ascii=False, sort_keys=True)
+        if response_schema
+        else ""
+    )
+    schema_hash = hashlib.sha256(schema_json.encode()).hexdigest()
+    pipeline_version = f"{executor_name}:{_CACHE_PIPELINE}"
+    material = "\n".join(
+        [",".join(content_hashes), query_norm, schema_hash, pipeline_version]
+    )
+    key = hashlib.sha256(material.encode()).hexdigest()
+    return key, query_norm, schema_hash, pipeline_version
 
 
 def _version_row(store: DocumentStore, version_id: int) -> dict[str, Any] | None:
@@ -537,6 +586,9 @@ def query_documents(
     store = DocumentStore(
         home_path / "geodocs.sqlite3", files_dir=home_path / "files"
     )
+    cached: dict[str, Any] | None = None
+    cache_parts: tuple[str, str, str, str] | None = None
+    content_hashes: list[str] = []
     try:
         resolved, warnings = _resolve_documents(store, documents)
         static = (
@@ -544,6 +596,13 @@ def query_documents(
             if resolved
             else None
         )
+        if resolved and static is None:
+            # §58 ТЗ: кэш extraction до вызова LLM
+            content_hashes = _content_hashes(store, resolved)
+            cache_parts = _cache_key(
+                content_hashes, query, response_schema, executor_name
+            )
+            cached = store.get_cached_answer(cache_parts[0])
     finally:
         store.close()
     if not resolved:
@@ -558,6 +617,20 @@ def query_documents(
         static.duration_seconds = time.monotonic() - started
         _persist_query(home_path, query, static)
         return static
+    if cached is not None:
+        result = QueryResult(
+            **{
+                key: value
+                for key, value in cached.items()
+                if key in QueryResult.model_fields
+                and key not in {"warnings", "duration_seconds"}
+            }
+        )
+        result.warnings = [*warnings, "ответ из кэша extraction (§58)"]
+        result.duration_seconds = time.monotonic() - started
+        result.executor = "answer-cache"
+        _persist_query(home_path, query, result)
+        return result
 
     executor = _ask_executor(home_path, executor_name, config)
     prompt = build_query_prompt(resolved, query, response_schema)
@@ -622,5 +695,28 @@ def query_documents(
             "evidence_required: success/partial без цитат понижен до"
             " insufficient_evidence"
         )
+    # §58 ТЗ: кэшируем только доказательные ответы (success/partial с цитатами)
+    if (
+        cache_parts is not None
+        and result.status in (QueryStatus.SUCCESS, QueryStatus.PARTIAL)
+        and result.evidence
+    ):
+        try:
+            store = DocumentStore(
+                home_path / "geodocs.sqlite3", files_dir=home_path / "files"
+            )
+            try:
+                store.save_answer(
+                    cache_parts[0],
+                    content_hashes=content_hashes,
+                    query_norm=cache_parts[1],
+                    schema_hash=cache_parts[2],
+                    pipeline_version=cache_parts[3],
+                    result=result.model_dump(mode="json"),
+                )
+            finally:
+                store.close()
+        except Exception as exc:  # noqa: BLE001 — кэш не должен ронять ответ
+            result.warnings.append(f"ответ не сохранён в кэш: {exc}")
     _persist_query(home_path, query, result)
     return result

@@ -33,10 +33,17 @@ from .agent.portals.rgis import RgisAdapter
 from .agent.query import QueryResult, query_documents
 from .agent.runner import run_task
 from .agent.tasks import AgentTask
-from .models import DocType, DocumentRef, FetchStatus, SourceName
+from .models import (
+    DocType,
+    DocumentRef,
+    FetchStatus,
+    SourceName,
+    observation_query,
+)
 from .store import DocumentStore
 
 _UNKNOWN_VERSION_DATE = "unknown"  # как в store.py: редакция без даты
+_NEGATIVE_CACHE_DAYS = 7  # §53 ТЗ: окно negative cache по цели поиска
 
 
 class AcquireStatus(str, Enum):
@@ -269,6 +276,24 @@ def acquire_documents(
                 warnings=[*warnings, "для внешнего поиска нужен номер документа"],
             )
 
+        # §53 ТЗ: negative cache — по этой цели недавно уже искали безуспешно.
+        identity = observation_query(municipality, doc_type, number, version_date)
+        negative = store.negative_observations(
+            identity, since_days=_NEGATIVE_CACHE_DAYS
+        )
+        if negative:
+            return AcquireResult(
+                status=AcquireStatus.NOT_FOUND,
+                warnings=[
+                    *warnings,
+                    (
+                        "negative cache: цель уже не находилась"
+                        f" ({negative[0]['created_at'][:10]},"
+                        f" повтор не ищем {_NEGATIVE_CACHE_DAYS} дн.)"
+                    ),
+                ],
+            )
+
         if rows:
             target = rows[-1]
             task = AgentTask(
@@ -339,6 +364,12 @@ def acquire_documents(
             if result.status == "not_found"
             else FetchStatus.SEARCH_FAILED,
         )
+        # §53 ТЗ: итоговый not_found — negative cache для следующих acquire
+        if result.status == "not_found":
+            store.record_observation(
+                identity, None, "not_found",
+                detail=(result.error or "агент: документ не найден")[:300],
+            )
         if result.error:
             warnings.append(result.error)
         return AcquireResult(status=status, warnings=warnings)

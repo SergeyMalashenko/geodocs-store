@@ -36,8 +36,15 @@ from typing import Any
 
 import httpx
 
-from ..models import DocType, DocumentRef, FileRecord, SourceName
+from ..models import (
+    DocType,
+    DocumentRef,
+    FileRecord,
+    SourceName,
+    observation_query,
+)
 from .gate import DOCUMENT_SUFFIXES, gate_pass, verify_files
+from .match import DocumentMatch, match_document
 from .portals import Candidate, DocQuery, PortalError, get_portal, list_portals
 
 INBOX_ENV = "GEODOCS_AGENT_INBOX"
@@ -425,6 +432,53 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _observation_query(doc_hint: dict[str, Any]) -> str:
+    """Идентичность цели для SearchObservation: municipality|type|number|date."""
+    return observation_query(
+        str(doc_hint.get("municipality") or ""),
+        str(doc_hint.get("doc_type") or ""),
+        doc_hint.get("number"),
+        doc_hint.get("version_date"),
+    )
+
+
+def _match_downloaded(
+    doc_hint: dict[str, Any], files: list[Path], url: str
+) -> DocumentMatch:
+    """DocumentMatch по первому читаемому файлу; ошибка чтения → ambiguous."""
+    text: str | None = None
+    for path in files:
+        try:
+            text = _file_text(path)
+            break
+        except (ValueError, OSError, subprocess.SubprocessError):
+            continue
+    return match_document(
+        number=doc_hint.get("number"),
+        version_date=doc_hint.get("version_date"),
+        text=text,
+        source_url=url,
+    )
+
+
+def _record_blocked(
+    ctx: McpContext, doc_hint: dict[str, Any] | None, url: str, detail: str
+) -> None:
+    """SearchObservation «blocked» при ошибке скачивания; сбой не важен."""
+    if not doc_hint:
+        return
+    try:
+        store = _open_store(ctx)
+        try:
+            store.record_observation(
+                _observation_query(doc_hint), url, "blocked", detail=detail[:300]
+            )
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001, S110 — наблюдение не должно ломать импорт
+        pass
+
+
 async def import_document_impl(
     ctx: McpContext,
     url: str,
@@ -446,10 +500,12 @@ async def import_document_impl(
         downloaded = [Path(result["path"])]
     except PortalError as exc:
         if "HTML" not in str(exc):
+            _record_blocked(ctx, doc_hint, url, str(exc))
             return {"error": str(exc)}
         try:
             await _fetch_page(ctx, url)
         except (PortalError, httpx.HTTPError) as page_exc:
+            _record_blocked(ctx, doc_hint, url, f"{exc}; {page_exc}")
             return {"error": f"{exc}; страница тоже не открылась: {page_exc}"}
         after = {p.name for p in ctx.inbox.iterdir() if p.is_file()}
         downloaded = [
@@ -515,9 +571,30 @@ async def import_document_impl(
             reasons = "; ".join(
                 f"{Path(v.path).name}: {v.reason}" for v in verdicts if not v.ok
             )
+            store.record_observation(
+                _observation_query(doc_hint), url, "irrelevant",
+                detail=f"gate_rejected: {reasons or 'нет валидных файлов'}",
+            )
             return {
                 "error": f"gate_rejected: {reasons or 'нет валидных файлов'}",
                 "verdicts": [v.model_dump() for v in verdicts],
+            }
+        # DocumentMatch (§52 ТЗ): реквизиты скачанного файла против цели.
+        # mismatch — чужой документ, регистрация отклоняется.
+        match = _match_downloaded(doc_hint, copied, url)
+        store.record_observation(
+            _observation_query(doc_hint),
+            url,
+            "mismatch" if match.status == "mismatch" else "candidate",
+            detail=f"match={match.status}"
+            f" detected={match.detected_number}/{match.detected_date}",
+        )
+        if match.status == "mismatch":
+            return {
+                "error": "document_mismatch: реквизиты файла не совпадают"
+                " с целью (другой номер или дата)",
+                "match": match.model_dump(),
+                "inbox_files": [str(path) for path in copied],
             }
         store.record_agent_fetch(
             version_id,
@@ -543,6 +620,7 @@ async def import_document_impl(
             for path in copied
         ],
         "fetch_status": "downloaded",
+        "match": match.model_dump(),
     }
 
 

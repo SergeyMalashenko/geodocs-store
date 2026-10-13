@@ -185,3 +185,19 @@ class FileRecord(BaseModel):
     sha256: str | None = None
     title: str | None = None
     section: str | None = None
+
+
+def observation_query(
+    municipality: str,
+    doc_type: str,
+    number: str | None,
+    version_date: str | None,
+) -> str:
+    """Идентичность цели поиска для SearchObservation (единый формат).
+
+    Используется и при записи наблюдений (import_document/acquire), и при
+    чтении negative cache (acquire) — разнобой формата разорвёт кэш.
+    """
+    return "|".join(
+        str(part or "") for part in (municipality, doc_type, number, version_date)
+    )
