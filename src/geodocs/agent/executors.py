@@ -192,9 +192,28 @@ def _inbox_from_prompt(prompt: str, workdir: Path) -> Path:
     return workdir / "inbox"
 
 
+_DISCOVERY_HOME_ENV = "GEODOCS_HERMES_HOME"
+
+
 def _hermes_source_home() -> Path:
-    """Основной профиль Hermes: источник auth.json/.env/config.yaml."""
-    return Path(os.environ.get(_HERMES_HOME_ENV, str(Path.home() / ".hermes")))
+    """Профиль документного контура: источник auth.json/.env/config.yaml.
+
+    Два профиля Hermes в системе: discovery (этот — Qwen + tools: MCP
+    порталов и веб-поиск) и QA (`~/.hermes-critic` — gemma3:12b без tools).
+    Порядок выбора: env GEODOCS_HERMES_HOME → HERMES_HOME (явный env всегда
+    приоритетнее) → `~/.hermes-discovery`, если он создан → `~/.hermes`
+    (legacy fallback).
+    """
+    override = os.environ.get(_DISCOVERY_HOME_ENV)
+    if override:
+        return Path(override)
+    explicit = os.environ.get(_HERMES_HOME_ENV)
+    if explicit:
+        return Path(explicit)
+    discovery = Path.home() / ".hermes-discovery"
+    if discovery.is_dir():
+        return discovery
+    return Path.home() / ".hermes"
 
 
 class HermesExecutor(SubprocessExecutor):

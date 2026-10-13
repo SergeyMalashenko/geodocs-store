@@ -419,3 +419,54 @@ def test_match_document_statuses() -> None:
         number="0077", version_date=None,
         text="N 77 от 15.01.2026", source_url=None,
     ).detected_number == "77"
+
+
+# ---------------------------------------------------------------------------
+# Профили Hermes: discovery vs QA (два профиля, §43–45/§65–66 ТЗ)
+# ---------------------------------------------------------------------------
+
+
+def test_discovery_profile_env_override(monkeypatch, tmp_path: Path) -> None:
+    from geodocs.agent import executors
+
+    custom = tmp_path / "custom-discovery"
+    custom.mkdir()
+    monkeypatch.setenv("GEODOCS_HERMES_HOME", str(custom))
+    assert executors._hermes_source_home() == custom
+
+
+def test_discovery_profile_explicit_env_beats_discovery_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from geodocs.agent import executors
+
+    monkeypatch.delenv("GEODOCS_HERMES_HOME", raising=False)
+    legacy = tmp_path / "legacy"
+    monkeypatch.setenv("HERMES_HOME", str(legacy))
+    discovery = tmp_path / ".hermes-discovery"
+    discovery.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    # явный HERMES_HOME приоритетнее неявного дефолта ~/.hermes-discovery
+    assert executors._hermes_source_home() == legacy
+
+
+def test_discovery_profile_defaults_to_discovery_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from geodocs.agent import executors
+
+    monkeypatch.delenv("GEODOCS_HERMES_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    discovery = tmp_path / ".hermes-discovery"
+    discovery.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    assert executors._hermes_source_home() == discovery
+
+
+def test_discovery_profile_legacy_fallback(monkeypatch, tmp_path: Path) -> None:
+    from geodocs.agent import executors
+
+    monkeypatch.delenv("GEODOCS_HERMES_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)  # без .hermes-discovery
+    assert executors._hermes_source_home() == tmp_path / ".hermes"
