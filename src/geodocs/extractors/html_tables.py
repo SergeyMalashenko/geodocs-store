@@ -21,12 +21,12 @@ from .models import ExtractionOutcome, VriItem, VriTable, parse_number
 EXTRACTOR_NAME = "vri-html@1"
 
 _ZONE_ANY_RE = re.compile(
-    r"^\s*[А-ЯЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-я]?\s*[-–—]?\s+"
+    r"^\s*[А-ЯЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-я]?(?:-[А-ЯЁ]{1,2})?\s*[-–—]?\s+"
     r"(?:специализированная\s+)?зона\b",
     re.IGNORECASE,
 )
 _HEADER_NAME_RE = re.compile(
-    r"^\s*[А-ЯЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-я]?\s*[-–—]?\s+(?P<name>зона\b.*)$",
+    r"^\s*[А-ЯЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-я]?(?:-[А-ЯЁ]{1,2})?\s*[-–—]?\s+(?P<name>зона\b.*)$",
     re.IGNORECASE,
 )
 

@@ -25,7 +25,7 @@ _ROW_RE = re.compile(r"<w:tr[ >].*?</w:tr>", re.DOTALL)
 _CELL_RE = re.compile(r"<w:tc[ >].*?</w:tc>", re.DOTALL)
 _TEXT_RE = re.compile(r"<w:t[^>]*>([^<]*)</w:t>")
 _SECTION_START_RE = re.compile(
-    r"^\s*(?P<code>[А-ЯA-ZЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-яA-Za-z]?)"
+    r"^\s*(?P<code>[А-ЯA-ZЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-яA-Za-z]?(?:-[А-ЯA-ZЁ]{1,2})?)"
     r"\s*(?:[-–—]\s*)?(?P<name>ЗОНА\b.*)$",
     re.IGNORECASE,
 )

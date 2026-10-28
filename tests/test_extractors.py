@@ -273,6 +273,61 @@ def test_pdf_layout_section_locator() -> None:
     assert pdf_layout.locate_section(LAYOUT_FIXTURE, "СХ-2") is None
 
 
+SUFFIXED_LAYOUT_FIXTURE = """\
+                    СХ-2-Р - ЗОНА, ПРЕДНАЗНАЧЕННАЯ ДЛЯ ВЕДЕНИЯ САДОВОДСТВА
+     Зона, предназначенная для ведения садоводства СХ-2-Р, установлена для обеспечения садоводства.
+                                                  Основные виды разрешенного использования
+                                       Код                     Предельные размеры
+          Наименование ВРИ          обозначение              (кв. м)
+ п/п                                 ВРИ)                  min            max
+  1    Ведение садоводства           13.2*, **     600           500 000        40%          3
+                    СХ-2.1-Р - СПЕЦИАЛИЗИРОВАННАЯ ЗОНА, ПРЕДНАЗНАЧЕННАЯ ДЛЯ ВЕДЕНИЯ САДОВОДСТВА
+     Специализированная зона, предназначенная для ведения садоводства СХ-2.1-Р, установлена для обеспечения садоводства.
+                                                  Основные виды разрешенного использования
+                                       Код                     Предельные размеры
+          Наименование ВРИ          обозначение              (кв. м)
+ п/п                                 ВРИ)                  min            max
+  1    Ведение огородничества        13.1**        200              490         0%           3
+"""
+
+
+def test_pdf_layout_suffixed_zone_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Секции «СХ-2-Р»/«СХ-2.1-Р»: граница по заголовку с суффиксом, без мусора.
+
+    Регрессия: «СХ-2.1-Р» не закрывала секцию «СХ-2-Р» (суффикс «-Р» не
+    матчился), а код «2.1» из заголовка/описания попадал в строки таблицы.
+    """
+    monkeypatch.setattr(
+        pdf_layout, "run_pdftotext", lambda path: SUFFIXED_LAYOUT_FIXTURE
+    )
+    path = tmp_path / "reglament.pdf"
+
+    outcome = extract_vri_from_file(path, filename="reglament.pdf", zone_code="СХ-2-Р")
+
+    assert outcome.status == "extracted"
+    table = outcome.table
+    assert table is not None
+    assert [item.code for item in table.items] == ["13.2*"]
+    assert table.items[0].name == "Ведение садоводства"
+    assert table.items[0].area_min == 600
+    assert table.zone_name is not None and table.zone_name.startswith("ЗОНА,")
+
+    outcome = extract_vri_from_file(path, filename="reglament.pdf", zone_code="СХ-2.1-Р")
+
+    assert outcome.status == "extracted"
+    table = outcome.table
+    assert table is not None
+    assert [item.code for item in table.items] == ["13.1**"]
+    assert table.zone_name is not None and table.zone_name.startswith(
+        "СПЕЦИАЛИЗИРОВАННАЯ ЗОНА,"
+    )
+
+    # «СХ-2» не должна совпасть с заголовком «СХ-2-Р - ЗОНА…»
+    assert pdf_layout.locate_section(SUFFIXED_LAYOUT_FIXTURE, "СХ-2") is None
+
+
 def test_pdf_layout_scan_detector(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

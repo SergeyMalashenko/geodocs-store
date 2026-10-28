@@ -25,7 +25,8 @@ EXTRACTOR_NAME = "vri-pdf-layout@1"
 _PDFTOTEXT = shutil.which("pdftotext")
 _SCAN_CYRILLIC_THRESHOLD = 200
 _ZONE_ANY_RE = re.compile(
-    r"^\s*[А-ЯA-ZЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-яA-Za-z]?\s*[-–—]?\s+\S*\s*ЗОНА\b"
+    r"^\s*[А-ЯA-ZЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-яA-Za-z]?(?:-[А-ЯA-ZЁ]{1,2})?"
+    r"\s*[-–—]?\s+\S*\s*ЗОНА\b"
 )
 _CHAPTER_RE = re.compile(r"^\s*(Глава|Статья)\s+\d", re.IGNORECASE)
 _CORE_RE = re.compile(
@@ -38,7 +39,9 @@ _PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
 _NAME_WINDOW = 2
 # Голый код зоны на отдельной строке — заголовок секции КРТ-подобного layout
 # (без слова «ЗОНА»): «КРТ-3-63» над таблицей параметров и списком ВРИ.
-_ZONE_BARE_RE = re.compile(r"^\s*[А-ЯA-ZЁ]{1,4}(?:-\d+)+\s*$")
+_ZONE_BARE_RE = re.compile(
+    r"^\s*[А-ЯA-ZЁ]{1,4}(?:-\d+(?:\.\d+)?)+(?:-[А-ЯA-ZЁ]{1,2})?\s*$"
+)
 
 # Токоны чисто колоночной шапки: строка целиком из них — не кандидат в имена.
 # Словарь покрывает усечённые переносы заголовков колонок («Макси», «застро»).
@@ -121,10 +124,13 @@ _HEADER_KEYWORD_RES = tuple(
 def _section_start_re(zone_code: str) -> re.Pattern[str]:
     """Заголовок секции запрошенной зоны: «Ж-2 - ЗОНА…»/«СХ-2 ЗОНА…».
 
-    После кода запрещены буквы/цифры/точина — «Ж-2Б» и «Ж-2.1» не совпадут.
+    После кода запрещены буквы/цифры/точина и дефисный суффикс — «Ж-2Б»,
+    «Ж-2.1» и «СХ-2-Р» для «СХ-2» не совпадут. Между кодом и словом ЗОНА
+    допускаются уточняющие слова («СПЕЦИАЛИЗИРОВАННАЯ ЗОНА …»).
     """
     return re.compile(
-        rf"^\s*{re.escape(zone_code)}(?![\w.])\s*(?:[-–—]\s*)?ЗОНА\b",
+        rf"^\s*{re.escape(zone_code)}(?![\w.]|-[А-ЯA-ZЁA-Za-zа-яё])"
+        rf"\s*(?:[-–—]\s*)?(?:\S+\s+)*?ЗОНА\b",
         re.IGNORECASE,
     )
 
@@ -257,8 +263,23 @@ def _starts_upper(text: str) -> bool:
 def parse_section(section: str, zone_code: str, source_file: str) -> VriTable:
     """Парсит строки таблицы ВРИ внутри секции зоны."""
     lines = section.split("\n")
+    # Строки до первого маркера подраздела — заголовок и описание зоны;
+    # коды вида «СХ-2.1-Р» в них не табличные, в ядра не берём.
+    first_marker = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if any(
+                keyword in " ".join(line.split()).casefold()
+                for keyword in _SECTION_STOP_KEYWORDS
+            )
+        ),
+        None,
+    )
     cores: list[tuple[int, re.Match[str]]] = []
     for index, line in enumerate(lines):
+        if first_marker is not None and index < first_marker:
+            continue
         match = _CORE_RE.match(line)
         if match is None:
             continue
@@ -342,7 +363,8 @@ def parse_section(section: str, zone_code: str, source_file: str) -> VriTable:
     confidence = 0.8 if items else 0.5
     header_line = lines[0].strip()
     name_match = re.match(
-        r"^\s*[А-ЯA-ZЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-яA-Za-z]?\s*[-–—]?\s*(?P<name>ЗОНА\b.*)$",
+        r"^\s*[А-ЯA-ZЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-яA-Za-z]?(?:-[А-ЯA-ZЁ]{1,2})?"
+        r"\s*[-–—]?\s*(?P<name>(?:\S+\s+)*ЗОНА\b.*)$",
         header_line,
         re.IGNORECASE,
     )

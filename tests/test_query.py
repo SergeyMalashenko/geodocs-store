@@ -808,6 +808,21 @@ def test_zone_code_re_multisegment() -> None:
         "КРТ-3-63",
     ]
 
+
+def test_zone_code_re_letter_suffix() -> None:
+    """«СХ-2-Р»/«СХ-2.1-Р» целиком: буквенный суффикс не обрезается до «СХ-2»."""
+    from geodocs.agent.query import _ZONE_CODE_RE
+
+    text = (
+        "Верни таблицы видов разрешённого использования (ВРИ) территориальных"
+        " зон СХ-2-Р, СХ-2.1-Р и СХ-2.1 из указанных документов ПЗЗ"
+    )
+    assert sorted({code.upper() for code in _ZONE_CODE_RE.findall(text.upper())}) == [
+        "СХ-2-Р",
+        "СХ-2.1",
+        "СХ-2.1-Р",
+    ]
+
 _VRI_TABLE_PAYLOAD = {
     "zone_code": "Ж-1",
     "zone_name": "Зона жилой застройки",
