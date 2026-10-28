@@ -43,9 +43,8 @@ from .config import AgentTierConfig
 
 RESULT_MARKER = "=== RESULT ==="
 _UNKNOWN_VERSION_DATE = "unknown"  # как в store.py: редакция без даты
-_ZONE_CODE_RE = re.compile(
-    r"[А-ЯЁA-Z]{1,4}(?:-\d+(?:\.\d+)?)+(?:-[А-ЯЁA-Z]{1,2})?"
-)  # как в agent/mcp.py; СХ-2-Р и СХ-2.1-Р — целиком, без обрезки суффикса
+_ZONE_CODE_RE = re.compile(r"[А-ЯЁA-Z]{1,4}(?:-[0-9А-ЯЁA-Z.]+)+")  # как в agent/mcp.py
+# Сегменты после префикса — цифробуквенные: СХ-2, СХ-2-Р, СХ-2.1М-1, КРТ-3-21
 _ZOUIT_QUERY_RE = re.compile(r"зоуит|режим|ограничен", re.IGNORECASE)
 
 _TERMINAL_STATUSES = (

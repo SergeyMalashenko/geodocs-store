@@ -25,8 +25,7 @@ EXTRACTOR_NAME = "vri-pdf-layout@1"
 _PDFTOTEXT = shutil.which("pdftotext")
 _SCAN_CYRILLIC_THRESHOLD = 200
 _ZONE_ANY_RE = re.compile(
-    r"^\s*[А-ЯA-ZЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-яA-Za-z]?(?:-[А-ЯA-ZЁ]{1,2})?"
-    r"\s*[-–—]?\s+\S*\s*ЗОНА\b"
+    r"^\s*[А-ЯA-ZЁ]{1,4}(?:-[0-9А-ЯA-ZЁ.]+)+\s*[-–—]?\s+\S*\s*ЗОНА\b"
 )
 _CHAPTER_RE = re.compile(r"^\s*(Глава|Статья)\s+\d", re.IGNORECASE)
 _CORE_RE = re.compile(
@@ -39,9 +38,7 @@ _PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
 _NAME_WINDOW = 2
 # Голый код зоны на отдельной строке — заголовок секции КРТ-подобного layout
 # (без слова «ЗОНА»): «КРТ-3-63» над таблицей параметров и списком ВРИ.
-_ZONE_BARE_RE = re.compile(
-    r"^\s*[А-ЯA-ZЁ]{1,4}(?:-\d+(?:\.\d+)?)+(?:-[А-ЯA-ZЁ]{1,2})?\s*$"
-)
+_ZONE_BARE_RE = re.compile(r"^\s*[А-ЯA-ZЁ]{1,4}(?:-[0-9А-ЯA-ZЁ.]+)+\s*$")
 
 # Токоны чисто колоночной шапки: строка целиком из них — не кандидат в имена.
 # Словарь покрывает усечённые переносы заголовков колонок («Макси», «застро»).
@@ -363,7 +360,7 @@ def parse_section(section: str, zone_code: str, source_file: str) -> VriTable:
     confidence = 0.8 if items else 0.5
     header_line = lines[0].strip()
     name_match = re.match(
-        r"^\s*[А-ЯA-ZЁ]{1,4}-\d+(?:\.\d+)*[А-Яа-яA-Za-z]?(?:-[А-ЯA-ZЁ]{1,2})?"
+        r"^\s*[А-ЯA-ZЁ]{1,4}(?:-[0-9А-ЯA-ZЁ.]+)+"
         r"\s*[-–—]?\s*(?P<name>(?:\S+\s+)*ЗОНА\b.*)$",
         header_line,
         re.IGNORECASE,

@@ -52,9 +52,8 @@ _MAX_CANDIDATES = 20
 _MAX_TEXT_CHARS = 100_000
 _PDFTOTEXT = shutil.which("pdftotext")
 _UNKNOWN_VERSION_DATE = "unknown"  # как в store.py: редакция без даты
-_ZONE_CODE_RE = re.compile(
-    r"[А-ЯЁA-Z]{1,4}(?:-\d+(?:\.\d+)?)+(?:-[А-ЯЁA-Z]{1,2})?"
-)  # как в agent/query.py; СХ-2-Р и СХ-2.1-Р — целиком, без обрезки суффикса
+_ZONE_CODE_RE = re.compile(r"[А-ЯЁA-Z]{1,4}(?:-[0-9А-ЯЁA-Z.]+)+")  # как в agent/query.py
+# Сегменты после префикса — цифробуквенные: СХ-2, СХ-2-Р, СХ-2.1М-1, КРТ-3-21
 
 
 class McpMissingError(RuntimeError):
