@@ -282,14 +282,19 @@ def acquire_documents(
             identity, since_days=_NEGATIVE_CACHE_DAYS
         )
         if negative:
+            latest = negative[0]
+            reason = str(latest.get("detail") or "").strip()
             return AcquireResult(
                 status=AcquireStatus.NOT_FOUND,
                 warnings=[
                     *warnings,
                     (
                         "negative cache: цель уже не находилась"
-                        f" ({negative[0]['created_at'][:10]},"
-                        f" повтор не ищем {_NEGATIVE_CACHE_DAYS} дн.)"
+                        f" ({latest['created_at'][:10]},"
+                        f" повтор не ищем {_NEGATIVE_CACHE_DAYS} дн.;"
+                        f" причина: {latest['result']}"
+                        + (f" — {reason[:200]}" if reason else "")
+                        + ")"
                     ),
                 ],
             )

@@ -310,6 +310,9 @@ def test_negative_cache_blocks_repeat_search(home: Path, stub_type: None) -> Non
     assert second.status is AcquireStatus.NOT_FOUND
     assert _calls(counter) == 1  # повторно агент не запускался
     assert any("negative cache" in warning for warning in second.warnings)
+    # причина промаха проброшена в warnings (для сводок типа /status)
+    assert any("причина: not_found" in warning for warning in second.warnings)
+    assert any("агент: документ не найден" in warning for warning in second.warnings)
 
 
 # ---------------------------------------------------------------------------
